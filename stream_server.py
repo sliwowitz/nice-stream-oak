@@ -73,6 +73,13 @@ W, H   = 1280, 800
 # 60 is the sensor target; stereo tops out around ~38 fps at 800P (DEFAULT
 # preset) while rgb and pose reach the full 60. Consumers just take the newest.
 FPS    = float(os.environ.get("NICE_STREAM_FPS", "60"))
+
+# IR emitters (off by default in depthai). Dot projector gives stereo texture
+# on blank surfaces; flood light lets the mono cameras see in a dark room.
+# NOTE: the pose NN runs on RGB, which IR does not help -- in a truly dark
+# room pose will degrade long before depth does.
+IR_DOT   = float(os.environ.get("NICE_STREAM_IR_DOT", "0.8"))
+IR_FLOOD = float(os.environ.get("NICE_STREAM_IR_FLOOD", "0.5"))
 NBUF   = 3
 HDR    = 64
 MAGIC_FRAME = 0x314B534E            # 'NSK1'
@@ -270,8 +277,13 @@ def stream_once(ids):
             left=left.requestOutput((W, H), fps=FPS),
             right=right.requestOutput((W, H), fps=FPS))
         stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
-        # One pixel grid for everything: depth in the RGB camera's perspective.
-        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+
+        # One pixel grid for everything: depth warped into the RGB camera's
+        # perspective. setDepthAlign(CAM_A) is silently ineffective on RVC4,
+        # so alignment goes through an explicit ImageAlign node instead.
+        align = pipeline.create(dai.node.ImageAlign)
+        stereo.depth.link(align.input)
+        rgb_out.link(align.inputAlignTo)
 
         # On-device stabilisation. Temporal is the flicker killer: static
         # scenes stop shimmering. Runs on the RVC4, costs the host nothing.
@@ -290,7 +302,7 @@ def stream_once(ids):
 
         # Small queues, non-blocking: we always want the newest frame, and a
         # stalled consumer must never apply back-pressure to the device.
-        q_depth = stereo.depth.createOutputQueue(maxSize=2, blocking=False)
+        q_depth = align.outputAligned.createOutputQueue(maxSize=2, blocking=False)
         q_rgb   = rgb_out.createOutputQueue(maxSize=2, blocking=False)
         q_pose  = nn.out.createOutputQueue(maxSize=2, blocking=False)
 
@@ -302,6 +314,10 @@ def stream_once(ids):
         write_frame_headers(K[0][0], K[1][1], K[0][2], K[1][2])
         log.info("intrinsics (CAM_A-aligned) fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
                  K[0][0], K[1][1], K[0][2], K[1][2])
+
+        device.setIrLaserDotProjectorIntensity(IR_DOT)
+        device.setIrFloodLightIntensity(IR_FLOOD)
+        log.info("IR emitters: dot %.0f%%, flood %.0f%%", IR_DOT * 100, IR_FLOOD * 100)
 
         set_status(STATUS_STREAMING)
 
