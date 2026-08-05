@@ -80,6 +80,11 @@ FPS    = float(os.environ.get("NICE_STREAM_FPS", "60"))
 # room pose will degrade long before depth does.
 IR_DOT   = float(os.environ.get("NICE_STREAM_IR_DOT", "0.8"))
 IR_FLOOD = float(os.environ.get("NICE_STREAM_IR_FLOOD", "0.5"))
+
+# Where the pose NN looks. "left" = the IR-flood-lit mono camera, usable in a
+# dark room; keypoints are remapped into the CAM_A frame server-side so
+# consumers never notice. "rgb" = the colour camera (needs visible light).
+POSE_SOURCE = os.environ.get("NICE_STREAM_POSE_SOURCE", "left")
 NBUF   = 3
 HDR    = 64
 MAGIC_FRAME = 0x314B534E            # 'NSK1'
@@ -217,8 +222,13 @@ def depth_at(depth_frame, px, py):
     return float(np.median(valid)) * 0.001
 
 
-def write_pose(detections, depth_frame, frame_id):
-    """Fill the pose segment: top MAX_PERSONS detections by confidence."""
+def write_pose(detections, depth_frame, frame_id, remap=None):
+    """Fill the pose segment: top MAX_PERSONS detections by confidence.
+
+    depth_frame must be in the same frame the keypoints are in. When the NN
+    runs on the left mono camera, `remap` converts (px, py, z) from the left
+    frame into CAM_A pixels + metres so the stream contract never changes.
+    """
     buf = shm_pose.buf
     dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
     dets = dets[:MAX_PERSONS]
@@ -237,6 +247,8 @@ def write_pose(detections, depth_frame, frame_id):
             if i < len(kps):
                 px, py = keypoint_pixels(kps[i])
                 z = depth_at(depth_frame, px, py) if kps[i].confidence > 0.3 else 0.0
+                if remap is not None and z > 0.0:
+                    px, py, z = remap(px, py, z)
                 joints.append((px, py, z, kps[i].confidence))
             else:
                 joints.append((0.0, 0.0, 0.0, 0.0))
@@ -298,13 +310,19 @@ def stream_once(ids):
         pp.thresholdFilter.minRange = 300       # mm, matches ValidRange in Unity
         pp.thresholdFilter.maxRange = 12000
 
-        nn = pipeline.create(ParsingNeuralNetwork).build(cam_rgb, POSE_MODEL)
+        pose_on_left = POSE_SOURCE == "left"
+        nn = pipeline.create(ParsingNeuralNetwork).build(
+            left if pose_on_left else cam_rgb, POSE_MODEL)
 
         # Small queues, non-blocking: we always want the newest frame, and a
         # stalled consumer must never apply back-pressure to the device.
         q_depth = align.outputAligned.createOutputQueue(maxSize=2, blocking=False)
         q_rgb   = rgb_out.createOutputQueue(maxSize=2, blocking=False)
         q_pose  = nn.out.createOutputQueue(maxSize=2, blocking=False)
+        # Left-frame keypoints need left-frame depth: tap the raw (pre-align,
+        # rectified-left) depth as well. Post-processing filters still apply.
+        q_raw   = stereo.depth.createOutputQueue(maxSize=2, blocking=False) \
+                  if pose_on_left else None
 
         pipeline.start()
 
@@ -319,9 +337,37 @@ def stream_once(ids):
         device.setIrFloodLightIntensity(IR_FLOOD)
         log.info("IR emitters: dot %.0f%%, flood %.0f%%", IR_DOT * 100, IR_FLOOD * 100)
 
+        remap = None
+        if pose_on_left:
+            KB = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_B, W, H)
+            fxB, fyB, cxB, cyB = KB[0][0], KB[1][1], KB[0][2], KB[1][2]
+            fxA, fyA, cxA, cyA = K[0][0], K[1][1], K[0][2], K[1][2]
+            E = np.array(calib.getCameraExtrinsics(
+                dai.CameraBoardSocket.CAM_B, dai.CameraBoardSocket.CAM_A),
+                dtype=np.float64)
+            # depthai extrinsic translations are centimetres; metres if someone
+            # fixes that upstream. The stereo baseline is a few cm, so scale
+            # by magnitude.
+            if np.linalg.norm(E[:3, 3]) > 1.0:
+                E[:3, 3] /= 100.0
+            R, t = E[:3, :3], E[:3, 3]
+            log.info("pose on LEFT mono; B->A baseline %.1f mm",
+                     np.linalg.norm(t) * 1000)
+
+            def remap(px, py, z):
+                p = R @ np.array([(px - cxB) * z / fxB,
+                                  (py - cyB) * z / fyB, z]) + t
+                if p[2] <= 0.0:
+                    return 0.0, 0.0, 0.0
+                return (fxA * p[0] / p[2] + cxA,
+                        fyA * p[1] / p[2] + cyA, p[2])
+        else:
+            log.info("pose on RGB")
+
         set_status(STATUS_STREAMING)
 
-        depth_frame = None          # newest depth, for lifting keypoints to 3D
+        depth_frame = None          # newest CAM_A-aligned depth (the SHM stream)
+        raw_depth   = None          # newest rectified-left depth (keypoint z)
         last_frame_at = time.time()
         fps_n, fps_t0 = 0, time.time()
 
@@ -354,10 +400,17 @@ def stream_once(ids):
                 commit_frame(shm_rgb.buf, ids["rgb"])
                 got_any = True
 
+            if q_raw is not None:
+                pkt = q_raw.tryGet()
+                if pkt is not None:
+                    raw_depth = np.ascontiguousarray(pkt.getFrame(), dtype=np.uint16)
+                    got_any = True
+
             pkt = q_pose.tryGet()
-            if pkt is not None and depth_frame is not None:
+            pose_depth = raw_depth if pose_on_left else depth_frame
+            if pkt is not None and pose_depth is not None:
                 ids["pose"] += 1
-                write_pose(pkt.detections, depth_frame, ids["pose"])
+                write_pose(pkt.detections, pose_depth, ids["pose"], remap)
                 got_any = True
 
             if not got_any:
