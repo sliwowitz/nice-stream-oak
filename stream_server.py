@@ -85,6 +85,15 @@ IR_FLOOD = float(os.environ.get("NICE_STREAM_IR_FLOOD", "0.5"))
 # dark room; keypoints are remapped into the CAM_A frame server-side so
 # consumers never notice. "rgb" = the colour camera (needs visible light).
 POSE_SOURCE = os.environ.get("NICE_STREAM_POSE_SOURCE", "left")
+
+# Stereo quality preset. HIGH_DETAIL maximizes point-cloud quality (subpixel,
+# heavy post-processing) at some fps cost; DEFAULT is the faster fallback.
+STEREO_PRESET = os.environ.get("NICE_STREAM_STEREO_PRESET", "HIGH_DETAIL")
+
+# 1 = skip the graceful device teardown on shutdown (dev iterations only:
+# the clean close is what protects the OAK-4 from wedging into a state that
+# needs a replug, so leave this off in production).
+FAST_EXIT = os.environ.get("NICE_STREAM_FAST_EXIT", "0") == "1"
 NBUF   = 3
 HDR    = 64
 MAGIC_FRAME = 0x314B534E            # 'NSK1'
@@ -167,6 +176,10 @@ def _stop(signum, _frame):
     global _running
     log.info("signal %s -- shutting down", signum)
     _running = False
+    if FAST_EXIT:
+        log.warning("FAST_EXIT: skipping graceful device teardown "
+                    "(dev only -- the camera may need a replug afterwards)")
+        os._exit(130)
 
 
 signal.signal(signal.SIGINT, _stop)
@@ -292,7 +305,10 @@ def stream_once(ids):
         stereo = pipeline.create(dai.node.StereoDepth).build(
             left=left.requestOutput((W, H), fps=FPS),
             right=right.requestOutput((W, H), fps=FPS))
-        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
+        preset = getattr(dai.node.StereoDepth.PresetMode, STEREO_PRESET,
+                         dai.node.StereoDepth.PresetMode.HIGH_DETAIL)
+        stereo.setDefaultProfilePreset(preset)
+        log.info("stereo preset: %s", preset.name)
 
         # One pixel grid for everything: depth warped into the RGB camera's
         # perspective. setDepthAlign(CAM_A) is silently ineffective on RVC4,
@@ -313,6 +329,11 @@ def stream_once(ids):
         pp.speckleFilter.speckleRange = 50
         pp.thresholdFilter.minRange = 300       # mm, matches ValidRange in Unity
         pp.thresholdFilter.maxRange = 12000
+        # Edge-preserving smoothing + small hole filling: visibly calmer
+        # point-cloud surfaces; costs device compute we now have to spare.
+        pp.spatialFilter.enable = True
+        pp.spatialFilter.holeFillingRadius = 2
+        pp.spatialFilter.numIterations = 1
 
         pose_on_left = POSE_SOURCE == "left"
         nn = pipeline.create(ParsingNeuralNetwork).build(
