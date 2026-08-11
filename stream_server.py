@@ -281,7 +281,11 @@ def stream_once(ids):
 
     with dai.Pipeline(dai.Device(info)) as pipeline:
         cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-        rgb_out = cam_rgb.requestOutput((W, H), dai.ImgFrame.Type.RGB888i, fps=FPS)
+        # Undistorted: the wide-lens RGB is heavily distorted, and ImageAlign
+        # outputs undistorted depth -- both sides must agree or colours slide
+        # off the points toward the frame edges.
+        rgb_out = cam_rgb.requestOutput((W, H), dai.ImgFrame.Type.RGB888i,
+                                        fps=FPS, enableUndistortion=True)
 
         left  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
         right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
