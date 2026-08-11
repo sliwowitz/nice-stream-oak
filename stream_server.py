@@ -5,8 +5,9 @@ Supersedes depth_server.py. One pipeline, three segments:
 
   nice_stream_depth   u16 depth, millimetres, aligned to the RGB camera
   nice_stream_rgb     RGB888 interleaved, same resolution & intrinsics as depth
-  nice_stream_pose    3D skeletons: YOLOv8-large-pose 2D keypoints lifted to
-                      metres by sampling the aligned depth map
+  nice_stream_pose    3D skeletons: 2D keypoints from a configurable HubAI
+                      pose model (default YOLOv8-large) lifted to metres by
+                      sampling the aligned depth map
 
 Because depth is aligned to CAM_A, all three streams share one set of
 intrinsics and one pixel grid: a depth pixel, its colour and a keypoint at the
@@ -74,10 +75,12 @@ W, H   = 1280, 800
 # preset) while rgb and pose reach the full 60. Consumers just take the newest.
 FPS    = float(os.environ.get("NICE_STREAM_FPS", "60"))
 
-# IR emitters (off by default in depthai). Dot projector gives stereo texture
-# on blank surfaces; flood light lets the mono cameras see in a dark room.
-# NOTE: the pose NN runs on RGB, which IR does not help -- in a truly dark
-# room pose will degrade long before depth does.
+# IR emitters (off by default in depthai; devices without them ignore these).
+# Dot projector gives stereo texture on blank surfaces; flood light lets the
+# mono cameras see in a dark room. NOTE: with pose on the left mono (the
+# default), the NN sees both emitters -- flood is what keeps pose alive in
+# the dark, but the dot speckle lands on the very frames the NN reads. If
+# pose quality matters more than depth on blank walls, try IR_DOT=0.
 IR_DOT   = float(os.environ.get("NICE_STREAM_IR_DOT", "0.8"))
 IR_FLOOD = float(os.environ.get("NICE_STREAM_IR_FLOOD", "0.5"))
 
@@ -94,13 +97,34 @@ STEREO_PRESET = os.environ.get("NICE_STREAM_STEREO_PRESET", "HIGH_DETAIL")
 # the clean close is what protects the OAK-4 from wedging into a state that
 # needs a replug, so leave this off in production).
 FAST_EXIT = os.environ.get("NICE_STREAM_FAST_EXIT", "0") == "1"
+
+# Dev convenience: --interactive (or NICE_STREAM_INTERACTIVE=1, e.g. in a
+# PyCharm run configuration) asks for the camera profile in the terminal on
+# startup. Production runs leave this off and configure via env vars.
+INTERACTIVE = ("--interactive" in sys.argv
+               or os.environ.get("NICE_STREAM_INTERACTIVE", "0") == "1")
 NBUF   = 3
 HDR    = 64
 MAGIC_FRAME = 0x314B534E            # 'NSK1'
 MAGIC_POSE  = 0x504B534E            # 'NSKP'
 VERSION     = 1
 
-POSE_MODEL   = "luxonis/yolov8-large-pose-estimation:coco-640x352"
+# Any HubAI slug depthai-nodes can parse (the YOLO-pose family is the safe
+# bet). Input size is read from the model archive; frames are letterboxed
+# into it and keypoints mapped back to full-frame pixels.
+POSE_MODEL = os.environ.get(
+    "NICE_STREAM_POSE_MODEL",
+    "luxonis/yolov8-large-pose-estimation:coco-640x352")
+
+# Known-good options for the interactive picker (slug, blurb). The zoo has
+# no stronger RVC4 pose model than yolov8-large; anything newer arrives via
+# custom slug (or NICE_STREAM_POSE_MODEL) after a HubAI conversion.
+KNOWN_POSE_MODELS = [
+    ("luxonis/yolov8-large-pose-estimation:coco-640x352",
+     "best quality, ~169 inf/s RVC4"),
+    ("luxonis/yolov8-nano-pose-estimation:coco-512x288",
+     "fastest, ~596 inf/s RVC4"),
+]
 MAX_PERSONS  = 8
 NUM_KP       = 17
 FLOATS_PER_KP = 4
@@ -130,6 +154,74 @@ logging.basicConfig(
               logging.FileHandler("stream_server.log", encoding="utf-8")],
 )
 log = logging.getLogger("nice-stream")
+
+
+# ------------------------------------------------------ interactive setup ---
+def _ask(label, current, cast=str):
+    """One prompt; Enter (or EOF -- no terminal attached) keeps `current`."""
+    try:
+        raw = input(f"  {label} [{current}]: ").strip()
+    except EOFError:
+        return current
+    if not raw:
+        return current
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"  ! not a valid {cast.__name__}; keeping {current}")
+        return current
+
+
+def _choose_model():
+    """Model menu, shown regardless of camera profile: pick a known-good
+    slug by number, 'c' for a custom one, Enter keeps the current model."""
+    global POSE_MODEL
+
+    print("\n  pose model:")
+    for i, (slug, blurb) in enumerate(KNOWN_POSE_MODELS, 1):
+        mark = "   <- current" if slug == POSE_MODEL else ""
+        print(f"    [{i}] {slug}   ({blurb}){mark}")
+    print("    [c] custom slug")
+    choice = str(_ask("model (Enter = keep current)", "keep")).strip().lower()
+
+    if choice in ("", "keep"):
+        return
+    if choice == "c":
+        POSE_MODEL = _ask("HubAI slug", POSE_MODEL)
+    elif choice.isdigit() and 1 <= int(choice) <= len(KNOWN_POSE_MODELS):
+        POSE_MODEL = KNOWN_POSE_MODELS[int(choice) - 1][0]
+    else:
+        print(f"  ! unknown choice; keeping {POSE_MODEL}")
+
+
+def configure_interactively():
+    """Terminal profile picker for development. Overrides the env-derived
+    config for this run only; a run without a terminal keeps env config."""
+    global POSE_SOURCE, IR_DOT, IR_FLOOD
+
+    print("\n=== nice-stream setup ===")
+    print("  [1] non-IR camera (dev)      pose=rgb   dot=0    flood=0")
+    print("  [2] IR camera (gallery)      pose=left  dot=0.8  flood=0.5")
+    print(f"  [3] env config               pose={POSE_SOURCE}  "
+          f"dot={IR_DOT:g}  flood={IR_FLOOD:g}")
+    print("  [4] custom")
+    choice = str(_ask("profile", "3")).strip()
+
+    if choice == "1":
+        POSE_SOURCE, IR_DOT, IR_FLOOD = "rgb", 0.0, 0.0
+    elif choice == "2":
+        POSE_SOURCE, IR_DOT, IR_FLOOD = "left", 0.8, 0.5
+    elif choice == "4":
+        while True:
+            POSE_SOURCE = _ask("pose source (left/rgb)", POSE_SOURCE)
+            if POSE_SOURCE in ("left", "rgb"):
+                break
+            print("  ! must be 'left' or 'rgb'")
+        IR_DOT   = _ask("IR dot intensity 0..1", IR_DOT, float)
+        IR_FLOOD = _ask("IR flood intensity 0..1", IR_FLOOD, float)
+
+    _choose_model()
+
 
 # ------------------------------------------------------------ shared mem ----
 def open_segment(name, size):
@@ -199,30 +291,65 @@ def pick_device():
 
 
 # ------------------------------------------------------------------ pose ----
-_kp_scale_logged = False
+_kp_convention_logged = False
 
 
-def keypoint_pixels(kp):
-    """Keypoint image coordinates in full-frame pixels.
+def make_kp_mapper(nn_w, nn_h):
+    """Returns kp -> (x, y) in full-frame pixels, undoing the letterbox
+    analytically -- assumes the NN input letterboxes exactly the (W, H)
+    frame's FOV. True for the left mono (natively 1280x800), NOT guaranteed
+    for the RGB path, where resize modes act on the sensor FOV per output
+    (4:3-class sensor: rgb_out crops to 16:10, the NN letterbox pads the
+    full sensor). The RGB path therefore prefers make_tx_mapper and only
+    falls back here.
 
-    depthai-nodes has flip-flopped between normalised and pixel coordinates;
-    detect once at runtime instead of trusting the docs.
+    Keypoints live in the NN's letterboxed input frame (the parser never
+    remaps them). depthai-nodes has also flip-flopped between normalised and
+    pixel coordinates; detect that once at runtime instead of trusting docs.
     """
-    global _kp_scale_logged
-    x, y = kp.imageCoordinates.x, kp.imageCoordinates.y
-    if abs(x) <= 2.0 and abs(y) <= 2.0:          # normalised
-        if not _kp_scale_logged:
-            log.info("keypoints arrive normalised; scaling by %dx%d", W, H)
-            _kp_scale_logged = True
-        return x * W, y * H
-    if not _kp_scale_logged:
-        log.info("keypoints arrive in pixels")
-        _kp_scale_logged = True
-    return x, y
+    scale = min(nn_w / W, nn_h / H)
+    pad_x = (nn_w - W * scale) * 0.5
+    pad_y = (nn_h - H * scale) * 0.5
+
+    def to_frame(kp):
+        global _kp_convention_logged
+        x, y = kp.imageCoordinates.x, kp.imageCoordinates.y
+        norm = abs(x) <= 2.0 and abs(y) <= 2.0
+        if not _kp_convention_logged:
+            log.info("keypoints arrive %s; undoing letterbox %dx%d -> %dx%d "
+                     "(scale %.3f, pad %.1f/%.1f)",
+                     "normalised" if norm else "in pixels",
+                     nn_w, nn_h, W, H, scale, pad_x, pad_y)
+            _kp_convention_logged = True
+        if norm:
+            x, y = x * nn_w, y * nn_h
+        return (x - pad_x) / scale, (y - pad_y) / scale
+
+    return to_frame
+
+
+def make_tx_mapper(pose_tx, target_tx, nn_w, nn_h):
+    """kp -> full-frame pixels via depthai's own ImgTransformations.
+
+    The parser forwards the true source->NN-input transformation on the
+    detections message; the rgb frames carry theirs. Remapping through the
+    pair is exact by construction -- sensor crops, scales and pads included --
+    where the analytic undo has to guess the sensor geometry.
+    """
+    def to_frame(kp):
+        x, y = kp.imageCoordinates.x, kp.imageCoordinates.y
+        if abs(x) <= 2.0 and abs(y) <= 2.0:              # normalised
+            x, y = x * nn_w, y * nn_h
+        p = pose_tx.remapPointTo(target_tx, dai.Point2f(x, y))
+        return p.x, p.y
+
+    return to_frame
 
 
 def depth_at(depth_frame, px, py):
     """Median depth (metres) in a small patch; 0.0 when nothing valid."""
+    if not (np.isfinite(px) and np.isfinite(py)):
+        return 0.0          # NaN keypoint must not recycle the session
     x, y = int(round(px)), int(round(py))
     if not (0 <= x < W and 0 <= y < H):
         return 0.0
@@ -235,12 +362,13 @@ def depth_at(depth_frame, px, py):
     return float(np.median(valid)) * 0.001
 
 
-def write_pose(detections, depth_frame, frame_id, remap=None):
+def write_pose(detections, depth_frame, frame_id, to_frame, remap=None):
     """Fill the pose segment: top MAX_PERSONS detections by confidence.
 
-    depth_frame must be in the same frame the keypoints are in. When the NN
-    runs on the left mono camera, `remap` converts (px, py, z) from the left
-    frame into CAM_A pixels + metres so the stream contract never changes.
+    `to_frame` maps a parser keypoint to full-frame pixels (letterbox undo);
+    depth_frame must be in that same frame. When the NN runs on the left mono
+    camera, `remap` converts (px, py, z) from the left frame into CAM_A
+    pixels + metres so the stream contract never changes.
     """
     buf = shm_pose.buf
     dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
@@ -258,7 +386,7 @@ def write_pose(detections, depth_frame, frame_id, remap=None):
         joints = []                          # (px, py, z, conf) per keypoint
         for i in range(NUM_KP):
             if i < len(kps):
-                px, py = keypoint_pixels(kps[i])
+                px, py = to_frame(kps[i])
                 z = depth_at(depth_frame, px, py) if kps[i].confidence > 0.3 else 0.0
                 if remap is not None and z > 0.0:
                     px, py, z = remap(px, py, z)
@@ -336,8 +464,31 @@ def stream_once(ids):
         pp.spatialFilter.numIterations = 1
 
         pose_on_left = POSE_SOURCE == "left"
-        nn = pipeline.create(ParsingNeuralNetwork).build(
-            left if pose_on_left else cam_rgb, POSE_MODEL)
+
+        # Resolve the model up front to learn its input size. Handing the
+        # Camera node straight to ParsingNeuralNetwork lets depthai pick the
+        # resize, and its default is a centre CROP: at 1280x800 -> 640x352
+        # that cut ~50 px off the top and bottom -- heads and ankles -- and
+        # skewed every keypoint scaled by full-frame height. An explicit
+        # LETTERBOX output keeps the whole FOV; make_kp_mapper undoes the pads.
+        desc = dai.NNModelDescription(POSE_MODEL)
+        desc.platform = pipeline.getDefaultDevice().getPlatformAsString()
+        nn_archive = dai.NNArchive(dai.getModelFromZoo(desc))
+        nn_w, nn_h = nn_archive.getInputWidth(), nn_archive.getInputHeight()
+        if not nn_w or not nn_h:
+            raise RuntimeError(f"model '{POSE_MODEL}' lacks a static input size")
+        log.info("pose model %s (input %dx%d)", POSE_MODEL, nn_w, nn_h)
+        kp_to_frame = make_kp_mapper(nn_w, nn_h)
+
+        # The RGB pose input is undistorted to match the aligned-depth grid
+        # (same as rgb_out); the left path stays raw so keypoints agree with
+        # the raw CAM_B intrinsics used by the B->A remap below.
+        pose_cam = left if pose_on_left else cam_rgb
+        pose_out = pose_cam.requestOutput(
+            (nn_w, nn_h), dai.ImgFrame.Type.BGR888i, fps=FPS,
+            resizeMode=dai.ImgResizeMode.LETTERBOX,
+            enableUndistortion=None if pose_on_left else True)
+        nn = pipeline.create(ParsingNeuralNetwork).build(pose_out, nn_archive)
 
         # Small queues, non-blocking: we always want the newest frame, and a
         # stalled consumer must never apply back-pressure to the device.
@@ -358,9 +509,17 @@ def stream_once(ids):
         log.info("intrinsics (CAM_A-aligned) fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
                  K[0][0], K[1][1], K[0][2], K[1][2])
 
-        device.setIrLaserDotProjectorIntensity(IR_DOT)
-        device.setIrFloodLightIntensity(IR_FLOOD)
-        log.info("IR emitters: dot %.0f%%, flood %.0f%%", IR_DOT * 100, IR_FLOOD * 100)
+        if IR_DOT > 0.0 or IR_FLOOD > 0.0:
+            try:
+                ok = device.setIrLaserDotProjectorIntensity(IR_DOT)
+                ok = device.setIrFloodLightIntensity(IR_FLOOD) and ok
+                log.info("IR emitters: dot %.0f%%, flood %.0f%%%s",
+                         IR_DOT * 100, IR_FLOOD * 100,
+                         "" if ok else "  (device reports no emitters)")
+            except RuntimeError as exc:
+                log.warning("IR emitters unavailable on this device: %s", exc)
+        else:
+            log.info("IR emitters off")
 
         remap = None
         if pose_on_left:
@@ -393,6 +552,8 @@ def stream_once(ids):
 
         depth_frame = None          # newest CAM_A-aligned depth (the SHM stream)
         raw_depth   = None          # newest rectified-left depth (keypoint z)
+        rgb_tx      = None          # newest rgb ImgTransformation (rgb pose path)
+        tx_mapper_logged = False
         last_frame_at = time.time()
         fps_n, fps_t0 = 0, time.time()
 
@@ -418,6 +579,7 @@ def stream_once(ids):
 
             pkt = q_rgb.tryGet()
             if pkt is not None:
+                rgb_tx = pkt.getTransformation()
                 ids["rgb"] += 1
                 off = HDR + (ids["rgb"] % NBUF) * RGB_SZ
                 shm_rgb.buf[off:off + RGB_SZ] = np.ascontiguousarray(
@@ -435,7 +597,22 @@ def stream_once(ids):
             pose_depth = raw_depth if pose_on_left else depth_frame
             if pkt is not None and pose_depth is not None:
                 ids["pose"] += 1
-                write_pose(pkt.detections, pose_depth, ids["pose"], remap)
+                # RGB path: undo the letterbox through the real transformations
+                # whenever both sides carry one (exact even when the NN input
+                # and rgb_out cover different sensor FOVs); analytic fallback
+                # otherwise. Left path: analytic is exact, and the B->A remap
+                # expects raw-left pixels anyway.
+                to_frame = kp_to_frame
+                if not pose_on_left and rgb_tx is not None:
+                    pose_tx = pkt.getTransformation()
+                    if pose_tx is not None:
+                        to_frame = make_tx_mapper(pose_tx, rgb_tx, nn_w, nn_h)
+                        if not tx_mapper_logged:
+                            log.info("rgb pose keypoints remapped via "
+                                     "ImgTransformation (FOV-exact)")
+                            tx_mapper_logged = True
+                write_pose(pkt.detections, pose_depth, ids["pose"],
+                           to_frame, remap)
                 got_any = True
 
             if not got_any:
@@ -450,6 +627,11 @@ def stream_once(ids):
 # ------------------------------------------------------------------ main ----
 def main():
     global _reconnects
+
+    if INTERACTIVE:
+        configure_interactively()
+    log.info("config: pose source=%s  model=%s  ir dot=%.2f flood=%.2f",
+             POSE_SOURCE, POSE_MODEL, IR_DOT, IR_FLOOD)
 
     write_frame_headers()
     set_status(STATUS_STARTING)
