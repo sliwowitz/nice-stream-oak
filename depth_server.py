@@ -34,8 +34,8 @@ import sys
 import time
 from multiprocessing import shared_memory
 
-import numpy as np
 import depthai as dai
+import numpy as np
 
 # ---------------------------------------------------------------- config ----
 SHM_NAME  = os.environ.get("NICE_STREAM_SHM", "nice_stream_depth")

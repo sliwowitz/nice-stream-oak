@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
 # SPDX-License-Identifier: MIT
-import struct, time
+import struct
 from multiprocessing import shared_memory
-import numpy as np, cv2
+
+import cv2
+import numpy as np
 
 shm = shared_memory.SharedMemory(name="nice_stream_depth")
 magic, ver, W, H, BPP, NBUF = struct.unpack_from("<6I", shm.buf, 0)

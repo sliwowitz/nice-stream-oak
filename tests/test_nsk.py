@@ -86,7 +86,7 @@ def test_depth_at_rules():
 def test_depth_edge_gate():
     good = [(0, 0, 2.0, 0.9)] * 5
     outlier = (0, 0, 6.0, 0.9)                 # sampled the wall behind
-    gated = nsk.gate_depth_edges(good + [outlier])
+    gated = nsk.gate_depth_edges([*good, outlier])
     assert gated[-1][2] == 0.0                 # z dropped, joint kept
     assert all(j[2] == 2.0 for j in gated[:-1])
     # fewer than 3 depth-lifted joints: not enough evidence, no gating

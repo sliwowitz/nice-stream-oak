@@ -34,9 +34,11 @@ Run with the venv (python-osc required):
 """
 
 import argparse
+import functools
 import math
 import time
 from multiprocessing import shared_memory
+from typing import cast
 
 from pythonosc import osc_bundle_builder, osc_message_builder, udp_client
 
@@ -44,8 +46,11 @@ import nsk
 from nsk import KP_CONF_MIN as MIN_JOINT_CONF
 from nsk import MAX_PERSONS as MAX_SLOTS
 
+# A 3-D point in metres, camera frame (y up, z away from the camera).
+Vec3 = tuple[float, float, float]
 
-def parse_args():
+
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--host", default="127.0.0.1", help="OSC receiver address")
     p.add_argument("--port", type=int, default=9000,
@@ -66,7 +71,16 @@ def parse_args():
     return p.parse_args()
 
 
-def attach(name):
+def _add_message(bundle: osc_bundle_builder.OscBundleBuilder, address: str,
+                 *values: float) -> None:
+    msg = osc_message_builder.OscMessageBuilder(address=address)
+    for v in values:
+        msg.add_arg(v)
+    bundle.add_content(msg.build())
+
+
+def attach(name: str) -> tuple[shared_memory.SharedMemory, int, int, int,
+                               nsk.Intrinsics]:
     """Block until the pose segment exists and its header parses.
 
     A producer (pose_server in particular) may create the segment well
@@ -80,7 +94,8 @@ def attach(name):
             print(f"waiting for '{name}' ...")
             time.sleep(1.0)
             continue
-        hdr = nsk.parse_pose_header(shm.buf)
+        # buf is memoryview | None in typeshed; never None on an open segment
+        hdr = nsk.parse_pose_header(cast(nsk.Buf, shm.buf))
         if hdr is None:
             shm.close()
             print(f"waiting for '{name}' header ...")
@@ -92,7 +107,7 @@ def attach(name):
         return shm, hdr["max_persons"], hdr["num_kp"], hdr["stride"], K
 
 
-def centroid_of(joints, K):
+def centroid_of(joints: list[nsk.Joint], K: nsk.Intrinsics) -> Vec3 | None:
     """Confidence-weighted metric centroid of joints with valid depth."""
     fx, fy, cx, cy = K
     sw = sx = sy = sz = 0.0
@@ -111,19 +126,20 @@ def centroid_of(joints, K):
 class Track:
     """One persistent person: smoothed position, speed, identity, OSC slot."""
 
-    def __init__(self, tid, slot, pos, now):
+    def __init__(self, tid: int, slot: int, pos: Vec3, now: float) -> None:
         self.id = tid
         self.slot = slot
-        self.pos = pos          # EMA-smoothed
+        self.pos: tuple[float, ...] = pos   # EMA-smoothed; always length 3
         self.speed = 0.0        # EMA-smoothed, m/s
         self.conf = 0.0
         self.last_seen = now
 
-    def update(self, pos, conf, now, tau):
+    def update(self, pos: Vec3, conf: float, now: float, tau: float) -> None:
         dt = max(1e-3, now - self.last_seen)
         k = min(1.0, dt / tau)
         prev = self.pos
-        self.pos = tuple(p + (q - p) * k for p, q in zip(self.pos, pos))
+        self.pos = tuple(p + (q - p) * k
+                         for p, q in zip(self.pos, pos, strict=True))
         inst = math.dist(self.pos, prev) / dt
         self.speed += (inst - self.speed) * k
         self.conf = conf
@@ -138,35 +154,37 @@ class Tracker:
     identity.
     """
 
-    def __init__(self, args):
+    def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.tracks = []
+        self.tracks: list[Track] = []
         self.next_id = 0
-        self.events = []        # ('entered'|'left', slot, id)
+        self.events: list[tuple[str, int, int]] = []    # ('entered'|'left', slot, id)
 
-    def _free_slot(self):
+    def _free_slot(self) -> int | None:
         used = {t.slot for t in self.tracks}
         for s in range(MAX_SLOTS):
             if s not in used:
                 return s
         return None
 
-    def step(self, detections, now):
+    def step(self, detections: list[tuple[float, Vec3]],
+             now: float) -> list[Track]:
         """detections: list of (conf, centroid). Returns active tracks."""
         self.events.clear()
 
         # pair (distance, track, detection) greedily on the floor plane
-        pairs = []
+        pairs: list[tuple[float, Track, int]] = []
         for t in self.tracks:
             gate = self.args.gate + self.args.gate_speed * (now - t.last_seen)
-            for di, (conf, c) in enumerate(detections):
+            for di, (_conf, c) in enumerate(detections):
                 d = math.hypot(c[0] - t.pos[0], c[2] - t.pos[2])
                 if d <= gate:
                     pairs.append((d, t, di))
         pairs.sort(key=lambda p: p[0])
 
-        matched_tracks, matched_dets = set(), set()
-        for d, t, di in pairs:
+        matched_tracks: set[int] = set()
+        matched_dets: set[int] = set()
+        for _d, t, di in pairs:
             if id(t) in matched_tracks or di in matched_dets:
                 continue
             matched_tracks.add(id(t))
@@ -188,7 +206,7 @@ class Tracker:
             self.events.append(("entered", t.slot, t.id))
 
         # expire tracks beyond the grace window
-        survivors = []
+        survivors: list[Track] = []
         for t in self.tracks:
             if now - t.last_seen > self.args.grace:
                 self.events.append(("left", t.slot, t.id))
@@ -198,7 +216,7 @@ class Tracker:
         return self.tracks
 
 
-def main():
+def main() -> None:
     args = parse_args()
     client = udp_client.SimpleUDPClient(args.host, args.port)
     shm, max_p, n_kp, stride, K = attach(args.segment)
@@ -209,14 +227,15 @@ def main():
 
     print(f"emitting to {args.host}:{args.port} at <= {args.rate:.0f} Hz")
     while True:
-        fid, persons = nsk.read_pose_frame(shm.buf, max_p, n_kp, stride)
+        fid, persons = nsk.read_pose_frame(cast(nsk.Buf, shm.buf),
+                                           max_p, n_kp, stride)
         now = time.time()
         if fid == last_fid or now - last_emit < 1.0 / args.rate:
             time.sleep(0.003)
             continue
         last_fid, last_emit = fid, now
 
-        detections = []
+        detections: list[tuple[float, Vec3]] = []
         for conf, joints in persons:
             c = centroid_of(joints, K)
             if c is not None:
@@ -238,12 +257,7 @@ def main():
 
         bundle = osc_bundle_builder.OscBundleBuilder(
             osc_bundle_builder.IMMEDIATELY)
-
-        def add(address, *values):
-            msg = osc_message_builder.OscMessageBuilder(address=address)
-            for v in values:
-                msg.add_arg(v)
-            bundle.add_content(msg.build())
+        add = functools.partial(_add_message, bundle)
 
         add("/nice/group/count", count)
         add("/nice/group/centroid", gx, gy, gz)

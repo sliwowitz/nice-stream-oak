@@ -40,13 +40,17 @@ import signal
 import struct
 import sys
 import time
+from collections.abc import Sequence
 from multiprocessing import shared_memory
+from types import FrameType
+from typing import Any, cast
 
 import cv2
 import numpy as np
+import numpy.typing as npt
 
 import nsk
-from nsk import HDR, KP_CONF_MIN, MAX_PERSONS, NUM_KP
+from nsk import KP_CONF_MIN, MAX_PERSONS, NUM_KP
 
 # ---------------------------------------------------------------- config ----
 SHM_DEPTH = os.environ.get("NICE_STREAM_SHM", "nice_stream_depth")
@@ -80,7 +84,7 @@ log = logging.getLogger("nice-pose")
 _running = True
 
 
-def _stop(signum, _frame):
+def _stop(signum: int, _frame: FrameType | None) -> None:
     global _running
     log.info("signal %s -- shutting down", signum)
     _running = False
@@ -91,7 +95,7 @@ signal.signal(signal.SIGTERM, _stop)
 
 
 # ------------------------------------------------------------ shared mem ----
-def try_attach(name):
+def try_attach(name: str) -> shared_memory.SharedMemory | None:
     """Attach to an existing segment; None while the producer hasn't made it."""
     try:
         return shared_memory.SharedMemory(name=name)
@@ -99,7 +103,7 @@ def try_attach(name):
         return None
 
 
-def ensure_pose_header(pose_buf, rgb_hdr):
+def ensure_pose_header(pose_buf: nsk.Buf, rgb_hdr: nsk.FrameHeader) -> None:
     """Write the NSKP header if nobody has. stream_server rewrites it (same
     values, real intrinsics) whenever the camera connects; never fight it."""
     hdr = nsk.parse_pose_header(pose_buf)
@@ -110,7 +114,8 @@ def ensure_pose_header(pose_buf, rgb_hdr):
 
 
 # ------------------------------------------------------------- pose write ---
-def build_persons(rtmo_persons, depth):
+def build_persons(rtmo_persons: Sequence[tuple[npt.NDArray[Any], npt.NDArray[Any]]],
+                  depth: npt.NDArray[np.uint16]) -> list[nsk.Person]:
     """RTMO output -> nsk person tuples: depth-lift each keypoint. The edge
     gate and serialization live in nsk.write_pose_slots.
 
@@ -129,7 +134,7 @@ def build_persons(rtmo_persons, depth):
 
 
 # ----------------------------------------------------------------- model ----
-def make_model():
+def make_model() -> Any:
     try:
         import onnxruntime as ort
     except ImportError:
@@ -169,7 +174,7 @@ def make_model():
 
 
 # ------------------------------------------------------------------ main ----
-def warn_if_other_writer(pose_buf):
+def warn_if_other_writer(pose_buf: nsk.Buf) -> None:
     """Two pose writers interleave frame ids and Unity sees garbage. If the
     id advances while we watch, the device NN is still on -- restart
     stream_server with NICE_STREAM_POSE_SOURCE=none."""
@@ -182,14 +187,14 @@ def warn_if_other_writer(pose_buf):
                     id0, id1)
 
 
-def main():
+def main() -> None:
     model = make_model()
 
     shm_rgb = shm_depth = None
     pose, created = nsk.open_segment(SHM_POSE, nsk.POSE_SZ)
     log.info("%s pose segment '%s'",
              "created" if created else "attached to", SHM_POSE)
-    warn_if_other_writer(pose.buf)
+    warn_if_other_writer(cast(memoryview, pose.buf))
     rgb_hdr = depth_hdr = None
     last_rgb_id = 0
     pose_id = 0
@@ -214,8 +219,8 @@ def main():
                 time.sleep(0.5)
                 continue
 
-            rgb_hdr = nsk.parse_frame_header(shm_rgb.buf)
-            depth_hdr = nsk.parse_frame_header(shm_depth.buf)
+            rgb_hdr = nsk.parse_frame_header(cast(memoryview, shm_rgb.buf))
+            depth_hdr = nsk.parse_frame_header(cast(memoryview, shm_depth.buf))
             if rgb_hdr is None or depth_hdr is None:
                 if not waiting_logged:
                     log.info("segments present, waiting for camera ...")
@@ -223,7 +228,7 @@ def main():
                 time.sleep(0.5)
                 continue
             waiting_logged = False
-            ensure_pose_header(pose.buf, rgb_hdr)
+            ensure_pose_header(cast(memoryview, pose.buf), rgb_hdr)
             now = time.time()
 
             # Dual-writer watchdog: every id in this segment should be one
@@ -233,7 +238,8 @@ def main():
             # foreign id: a relaunch's one-shot id-0 reset warns once, a
             # LIVE second writer (ids keep changing) re-warns every 10 s.
             if pose_id > 0 and now >= next_writer_warn:
-                (cur_id,) = struct.unpack_from("<Q", pose.buf, 24)
+                (cur_id,) = struct.unpack_from("<Q",
+                                               cast(memoryview, pose.buf), 24)
                 if cur_id == pose_id:
                     last_foreign_id = None
                 elif cur_id != last_foreign_id:
@@ -249,8 +255,8 @@ def main():
                 time.sleep(min(next_infer - now, 0.005))
                 continue
 
-            frame, fid = nsk.newest_frame(shm_rgb.buf, rgb_hdr, np.uint8, 3,
-                                          skip_id=last_rgb_id)
+            frame, fid = nsk.newest_frame(cast(memoryview, shm_rgb.buf), rgb_hdr,
+                                          np.uint8, 3, skip_id=last_rgb_id)
             if frame is None:
                 time.sleep(0.002)
                 continue
@@ -262,17 +268,19 @@ def main():
             kpts, scores = model(bgr)
 
             # rtmlib returns one all-zero person when nothing was found.
-            persons = [(k, s) for k, s in zip(kpts, scores) if s.max() > 0.0]
+            persons = [(k, s) for k, s in zip(kpts, scores, strict=True)
+                       if s.max() > 0.0]
             persons.sort(key=lambda p: float(np.mean(p[1])), reverse=True)
             persons = persons[:MAX_PERSONS]
 
-            depth, _ = nsk.newest_frame(shm_depth.buf, depth_hdr, np.uint16, 1)
+            depth, _ = nsk.newest_frame(cast(memoryview, shm_depth.buf),
+                                        depth_hdr, np.uint16, 1)
             if depth is None:
                 continue                     # no depth yet: hold last pose
 
             pose_id += 1
-            nsk.write_pose_slots(pose.buf, build_persons(persons, depth),
-                                 pose_id)
+            nsk.write_pose_slots(cast(memoryview, pose.buf),
+                                 build_persons(persons, depth), pose_id)
 
             fps_n += 1
             if fps_n >= 60:

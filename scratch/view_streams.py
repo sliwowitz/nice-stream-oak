@@ -9,8 +9,8 @@ and any remaining problem is on the Unity side.
 import struct
 from multiprocessing import shared_memory
 
-import numpy as np
 import cv2
+import numpy as np
 
 HDR = 64
 COCO_EDGES = [(5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12),

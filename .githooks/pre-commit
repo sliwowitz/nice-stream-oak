@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
+#
+# Full local gate before every commit: ruff, mypy, pytest, reuse.
+# One-time enable per clone:  git config core.hooksPath .githooks
+# Emergency bypass:           git commit --no-verify
+set -e
+
+PY=.venv/Scripts/python.exe                 # Windows venv
+[ -x "$PY" ] || PY=.venv/bin/python         # POSIX venv
+if [ ! -x "$PY" ]; then
+    echo "pre-commit: no venv found, skipping local gate (CI still checks)"
+    exit 0
+fi
+
+echo "pre-commit: ruff" && "$PY" -m ruff check .
+echo "pre-commit: mypy" && "$PY" -m mypy
+echo "pre-commit: pytest" && "$PY" -m pytest
+echo "pre-commit: reuse" && "$PY" -m reuse lint -q || {
+    echo "pre-commit: reuse lint failed"; exit 1; }
+echo "pre-commit: all green"

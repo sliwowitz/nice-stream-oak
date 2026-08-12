@@ -53,9 +53,46 @@ VERSION on both sides.
 
 import struct
 import time
+from collections.abc import Sequence
 from multiprocessing import shared_memory
+from typing import TypedDict
 
 import numpy as np
+import numpy.typing as npt
+
+# A writable view of a shared-memory segment (or a bytearray in tests).
+Buf = bytearray | memoryview
+
+# One keypoint on the wire: x_px, y_px, z_m, confidence.
+Joint = tuple[float, float, float, float]
+
+# One pose slot: (detection confidence, NUM_KP joints).
+Person = tuple[float, list[Joint]]
+
+Intrinsics = tuple[float, float, float, float]
+
+
+class FrameHeader(TypedDict):
+    """Parsed NSK1 header."""
+
+    version: int
+    w: int
+    h: int
+    bpp: int
+    nbuf: int
+    intrinsics: Intrinsics
+
+
+class PoseHeader(TypedDict):
+    """Parsed NSKP header."""
+
+    version: int
+    max_persons: int
+    num_kp: int
+    floats_per_kp: int
+    stride: int
+    intrinsics: Intrinsics
+
 
 HDR         = 64
 MAGIC_FRAME = 0x314B534E            # 'NSK1'
@@ -81,7 +118,7 @@ KP_CONF_MIN   = 0.3                 # keypoints below this get no depth lift
 
 
 # ------------------------------------------------------------ segments ------
-def open_segment(name, size):
+def open_segment(name: str, size: int) -> tuple[shared_memory.SharedMemory, bool]:
     """Create-or-attach, so producer/consumer start order never matters.
 
     Returns (segment, created).
@@ -93,20 +130,22 @@ def open_segment(name, size):
 
 
 # -------------------------------------------------------------- headers -----
-def write_frame_header(buf, w, h, bpp, nbuf, intrinsics=(0.0, 0.0, 0.0, 0.0)):
+def write_frame_header(buf: Buf, w: int, h: int, bpp: int, nbuf: int,
+                       intrinsics: Intrinsics = (0.0, 0.0, 0.0, 0.0)) -> None:
     """Layout + intrinsics of an NSK1 segment; commit/status are separate."""
     struct.pack_into("<6I", buf, 0, MAGIC_FRAME, VERSION, w, h, bpp, nbuf)
     struct.pack_into("<4f", buf, 40, *intrinsics)
 
 
-def write_pose_header(buf, intrinsics=(0.0, 0.0, 0.0, 0.0)):
+def write_pose_header(buf: Buf,
+                      intrinsics: Intrinsics = (0.0, 0.0, 0.0, 0.0)) -> None:
     """Layout + intrinsics of the NSKP segment; commit/status are separate."""
     struct.pack_into("<6I", buf, 0, MAGIC_POSE, VERSION,
                      MAX_PERSONS, NUM_KP, FLOATS_PER_KP, PERSON_STRIDE)
     struct.pack_into("<4f", buf, 48, *intrinsics)
 
 
-def parse_frame_header(buf):
+def parse_frame_header(buf: Buf) -> FrameHeader | None:
     """Parsed NSK1 header dict, or None while the producer hasn't written it."""
     magic, version, w, h, bpp, nbuf = struct.unpack_from("<6I", buf, 0)
     if magic != MAGIC_FRAME or w == 0 or h == 0 or nbuf == 0:
@@ -115,7 +154,7 @@ def parse_frame_header(buf):
             "intrinsics": struct.unpack_from("<4f", buf, 40)}
 
 
-def parse_pose_header(buf):
+def parse_pose_header(buf: Buf) -> PoseHeader | None:
     """Parsed NSKP header dict, or None on bad magic / implausible layout."""
     magic, version, max_p, n_kp, fpk, stride = struct.unpack_from("<6I", buf, 0)
     if magic != MAGIC_POSE or not (0 < max_p <= 64) or n_kp <= 0:
@@ -125,14 +164,16 @@ def parse_pose_header(buf):
             "intrinsics": struct.unpack_from("<4f", buf, 48)}
 
 
-def commit_frame(buf, frame_id, timestamp=None):
+def commit_frame(buf: Buf, frame_id: int, timestamp: float | None = None) -> None:
     """Publish a frame: id + timestamp in one write, always last."""
     struct.pack_into("<Qd", buf, 24, frame_id,
                      time.time() if timestamp is None else timestamp)
 
 
 # ------------------------------------------------------------ frame reads ---
-def newest_frame(buf, hdr, dtype, channels, skip_id=None):
+def newest_frame(buf: Buf, hdr: FrameHeader, dtype: npt.DTypeLike,
+                 channels: int, skip_id: int | None = None,
+                 ) -> tuple[npt.NDArray | None, int]:
     """Copy of the newest committed NSK1 frame + its id; (None, fid) when
     there is nothing new or no untorn copy could be taken.
 
@@ -162,7 +203,8 @@ def newest_frame(buf, hdr, dtype, channels, skip_id=None):
     return None, fid
 
 
-def read_pose_frame(buf, max_p, n_kp, stride):
+def read_pose_frame(buf: Buf, max_p: int, n_kp: int,
+                    stride: int) -> tuple[int, list[Person]]:
     """Seqlock read of the single-buffered pose segment.
 
     Returns (frame_id, [(confidence, [(px, py, z, conf)] * n_kp)]); empty
@@ -193,13 +235,13 @@ def read_pose_frame(buf, max_p, n_kp, stride):
 
 
 # ------------------------------------------------------------ depth lift ----
-def depth_at(depth, px, py):
+def depth_at(depth: npt.NDArray[np.uint16], px: float, py: float) -> float:
     """Median depth (metres) in a small patch of a u16-mm map; 0.0 when
     nothing valid (out of bounds, NaN coordinates, or an empty patch)."""
     if not (np.isfinite(px) and np.isfinite(py)):
         return 0.0          # a NaN keypoint must not kill the producer
     h, w = depth.shape
-    x, y = int(round(px)), int(round(py))
+    x, y = round(px), round(py)
     if not (0 <= x < w and 0 <= y < h):
         return 0.0
     x0, x1 = max(0, x - DEPTH_PATCH), min(w, x + DEPTH_PATCH + 1)
@@ -211,7 +253,7 @@ def depth_at(depth, px, py):
     return float(np.median(valid)) * 0.001
 
 
-def gate_depth_edges(joints):
+def gate_depth_edges(joints: Sequence[Joint]) -> list[Joint]:
     """Drop the z of joints implausibly far from the person's median depth.
 
     A keypoint on a silhouette boundary samples the background instead of
@@ -220,14 +262,15 @@ def gate_depth_edges(joints):
     """
     zs = [j[2] for j in joints if j[2] > 0.0]
     if len(zs) < 3:
-        return joints
+        return list(joints)
     ref = float(np.median(zs))
     return [(px, py, z if (z == 0.0 or abs(z - ref) <= JOINT_DEV_MAX) else 0.0, c)
             for px, py, z, c in joints]
 
 
 # ------------------------------------------------------------- pose write ---
-def write_pose_slots(buf, persons, frame_id, timestamp=None):
+def write_pose_slots(buf: Buf, persons: Sequence[Person], frame_id: int,
+                     timestamp: float | None = None) -> None:
     """Serialize persons into the NSKP body and commit the frame.
 
     persons: up to MAX_PERSONS of (confidence, joints) with joints a list of
@@ -250,7 +293,8 @@ def write_pose_slots(buf, persons, frame_id, timestamp=None):
 
 
 # -------------------------------------------------------------- letterbox ---
-def letterbox_transform(src_w, src_h, dst_w, dst_h):
+def letterbox_transform(src_w: float, src_h: float, dst_w: float,
+                        dst_h: float) -> tuple[float, float, float]:
     """(scale, pad_x, pad_y) placing a src frame centred into dst:
     dst = src * scale + pad. Invert to map detections back to src pixels."""
     scale = min(dst_w / src_w, dst_h / src_h)

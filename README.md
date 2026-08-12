@@ -29,8 +29,14 @@ readers).
 
 ```
 .venv/Scripts/python.exe -m pytest         # tests
+.venv/Scripts/python.exe -m ruff check .   # lint
+.venv/Scripts/python.exe -m mypy           # type check
 .venv/Scripts/python.exe -m reuse lint     # license compliance (REUSE 3.3)
 ```
+
+All four also run as a pre-commit hook (once per clone:
+`git config core.hooksPath .githooks`) and in CI. `git commit --no-verify`
+bypasses the hook in an emergency; CI still catches it.
 
 Docs (`mkdocs-terok`) are built and published to GitHub Pages by CI
 (`.github/workflows/docs.yml`) on every push to master — no local docs
