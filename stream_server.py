@@ -1,13 +1,20 @@
-"""
-nice-stream-oak: depth + rgb + multipose -> shared memory.
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
+"""nice-stream-oak camera server: depth + rgb + multipose -> shared memory.
 
-Supersedes depth_server.py. One pipeline, three segments:
+Supersedes depth_server.py. One depthai pipeline, three segments:
 
   nice_stream_depth   u16 depth, millimetres, aligned to the RGB camera
   nice_stream_rgb     RGB888 interleaved, same resolution & intrinsics as depth
   nice_stream_pose    3D skeletons: 2D keypoints from a configurable HubAI
                       pose model (default YOLOv8-large) lifted to metres by
-                      sampling the aligned depth map
+                      sampling the aligned depth map. Optionally disabled
+                      (POSE_SOURCE=none) in favour of the host backend,
+                      pose_server.py.
+
+The wire layout of all three segments lives in nsk.py -- the single source
+of truth shared with pose_server.py and osc_bridge.py, and mirrored by the
+Unity readers.
 
 Because depth is aligned to CAM_A, all three streams share one set of
 intrinsics and one pixel grid: a depth pixel, its colour and a keypoint at the
@@ -16,41 +23,6 @@ same (x, y) refer to the same ray. Unity does the unprojection.
 Designed to run unattended for weeks; the camera is assumed to be unreliable.
 Segments are created once and never torn down while this process lives.
 Consumers may attach before the camera exists and survive it vanishing.
-
-Frame header (little endian, 64 bytes) -- depth & rgb segments:
-   0  uint32  magic 'NSK1'
-   4  uint32  version
-   8  uint32  width
-  12  uint32  height
-  16  uint32  bytes_per_pixel
-  20  uint32  buffer_count
-  24  uint64  frame_id        <- written last, acts as the commit
-  32  float64 timestamp (unix seconds)
-  40  float32 fx, fy, cx, cy
-  56  uint32  status          <- 0 starting, 1 streaming, 2 reconnecting
-  60  uint32  reconnect_count
-
-Pose header (little endian, 64 bytes), magic 'NSKP':
-   0  uint32  magic
-   4  uint32  version
-   8  uint32  max_persons
-  12  uint32  num_keypoints   (17, COCO order)
-  16  uint32  floats_per_kp   (4: x_px, y_px, z_m, confidence)
-  20  uint32  person_stride   (bytes)
-  24  uint64  frame_id        <- written last, acts as the commit
-  32  float64 timestamp
-  40  uint32  num_persons     (valid persons this frame)
-  44  uint32  status
-  48  float32 fx, fy, cx, cy
-
-Pose body: max_persons fixed slots, each person_stride bytes:
-   0  float32 detection confidence (0 -> slot empty)
-   4  float32 reserved x3
-  16  17 x (float32 x_px, y_px, z_m, conf)   z_m = 0 -> no depth at that joint
-
-COCO keypoint order: nose, l_eye, r_eye, l_ear, r_ear, l_shoulder, r_shoulder,
-l_elbow, r_elbow, l_wrist, r_wrist, l_hip, r_hip, l_knee, r_knee, l_ankle,
-r_ankle.
 """
 
 import logging
@@ -59,11 +31,14 @@ import signal
 import struct
 import sys
 import time
-from multiprocessing import shared_memory
 
 import numpy as np
 import depthai as dai
 from depthai_nodes.node import ParsingNeuralNetwork
+
+import nsk
+from nsk import HDR, KP_CONF_MIN, MAX_PERSONS, NUM_KP, \
+    STATUS_STARTING, STATUS_STREAMING, STATUS_RECONNECTING
 
 # ---------------------------------------------------------------- config ----
 SHM_DEPTH = os.environ.get("NICE_STREAM_SHM", "nice_stream_depth")
@@ -87,6 +62,8 @@ IR_FLOOD = float(os.environ.get("NICE_STREAM_IR_FLOOD", "0.5"))
 # Where the pose NN looks. "left" = the IR-flood-lit mono camera, usable in a
 # dark room; keypoints are remapped into the CAM_A frame server-side so
 # consumers never notice. "rgb" = the colour camera (needs visible light).
+# "none" = no on-device pose; a host backend (pose_server.py) writes the
+# pose segment instead, and the RVC4 spends everything on depth.
 POSE_SOURCE = os.environ.get("NICE_STREAM_POSE_SOURCE", "left")
 
 # Stereo quality preset. HIGH_DETAIL maximizes point-cloud quality (subpixel,
@@ -103,11 +80,7 @@ FAST_EXIT = os.environ.get("NICE_STREAM_FAST_EXIT", "0") == "1"
 # startup. Production runs leave this off and configure via env vars.
 INTERACTIVE = ("--interactive" in sys.argv
                or os.environ.get("NICE_STREAM_INTERACTIVE", "0") == "1")
-NBUF   = 3
-HDR    = 64
-MAGIC_FRAME = 0x314B534E            # 'NSK1'
-MAGIC_POSE  = 0x504B534E            # 'NSKP'
-VERSION     = 1
+NBUF   = 3                          # frame ring depth (depth & rgb segments)
 
 # Any HubAI slug depthai-nodes can parse (the YOLO-pose family is the safe
 # bet). Input size is read from the model archive; frames are letterboxed
@@ -125,27 +98,13 @@ KNOWN_POSE_MODELS = [
     ("luxonis/yolov8-nano-pose-estimation:coco-512x288",
      "fastest, ~596 inf/s RVC4"),
 ]
-MAX_PERSONS  = 8
-NUM_KP       = 17
-FLOATS_PER_KP = 4
-PERSON_STRIDE = 16 + NUM_KP * FLOATS_PER_KP * 4     # 288 bytes
-DEPTH_PATCH   = 2                   # median over (2k+1)^2 px around a keypoint
-JOINT_DEV_MAX = 1.5                 # m; joints further than this from the
-                                    # person's median depth are depth-edge
-                                    # glitches (hand sampled the wall behind)
-
 DEPTH_SZ = W * H * 2
 RGB_SZ   = W * H * 3
-POSE_SZ  = HDR + MAX_PERSONS * PERSON_STRIDE
 
 PREFER_USB      = True
 RETRY_DELAY     = 3.0
 RETRY_DELAY_MAX = 30.0
 STALE_AFTER     = 5.0               # no depth frame for this long -> dead
-
-STATUS_STARTING     = 0
-STATUS_STREAMING    = 1
-STATUS_RECONNECTING = 2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -202,62 +161,65 @@ def configure_interactively():
     print("\n=== nice-stream setup ===")
     print("  [1] non-IR camera (dev)      pose=rgb   dot=0    flood=0")
     print("  [2] IR camera (gallery)      pose=left  dot=0.8  flood=0.5")
-    print(f"  [3] env config               pose={POSE_SOURCE}  "
+    print("  [3] host pose backend        pose=none  (run pose_server.py; IR from env)")
+    print(f"  [4] env config               pose={POSE_SOURCE}  "
           f"dot={IR_DOT:g}  flood={IR_FLOOD:g}")
-    print("  [4] custom")
-    choice = str(_ask("profile", "3")).strip()
+    print("  [5] custom")
+    choice = str(_ask("profile", "4")).strip()
 
     if choice == "1":
         POSE_SOURCE, IR_DOT, IR_FLOOD = "rgb", 0.0, 0.0
     elif choice == "2":
         POSE_SOURCE, IR_DOT, IR_FLOOD = "left", 0.8, 0.5
-    elif choice == "4":
+    elif choice == "3":
+        POSE_SOURCE = "none"
+    elif choice == "5":
         while True:
-            POSE_SOURCE = _ask("pose source (left/rgb)", POSE_SOURCE)
-            if POSE_SOURCE in ("left", "rgb"):
+            POSE_SOURCE = _ask("pose source (left/rgb/none)", POSE_SOURCE)
+            if POSE_SOURCE in ("left", "rgb", "none"):
                 break
-            print("  ! must be 'left' or 'rgb'")
+            print("  ! must be 'left', 'rgb' or 'none'")
         IR_DOT   = _ask("IR dot intensity 0..1", IR_DOT, float)
         IR_FLOOD = _ask("IR flood intensity 0..1", IR_FLOOD, float)
 
-    _choose_model()
+    if POSE_SOURCE != "none":                # model is moot without a device NN
+        _choose_model()
 
 
 # ------------------------------------------------------------ shared mem ----
-def open_segment(name, size):
-    try:
-        seg = shared_memory.SharedMemory(name=name, create=True, size=size)
-        log.info("created shared memory '%s' (%.1f MB)", name, size / 1e6)
-    except FileExistsError:
-        seg = shared_memory.SharedMemory(name=name)
-        log.info("attached to existing shared memory '%s'", name)
-    return seg
-
-
-shm_depth = open_segment(SHM_DEPTH, HDR + NBUF * DEPTH_SZ)
-shm_rgb   = open_segment(SHM_RGB,   HDR + NBUF * RGB_SZ)
-shm_pose  = open_segment(SHM_POSE,  POSE_SZ)
+# Created by main(), not at import, so tests can import this module freely.
+shm_depth = shm_rgb = shm_pose = None
 
 _reconnects = 0
 
 
+def create_segments():
+    global shm_depth, shm_rgb, shm_pose
+    for attr, name, size in (("shm_depth", SHM_DEPTH, HDR + NBUF * DEPTH_SZ),
+                             ("shm_rgb",   SHM_RGB,   HDR + NBUF * RGB_SZ),
+                             ("shm_pose",  SHM_POSE,  nsk.POSE_SZ)):
+        seg, created = nsk.open_segment(name, size)
+        globals()[attr] = seg
+        log.info("%s shared memory '%s' (%.1f MB)",
+                 "created" if created else "attached to", name, size / 1e6)
+
+
 def write_frame_headers(fx=0.0, fy=0.0, cx=0.0, cy=0.0):
-    for buf, bpp in ((shm_depth.buf, 2), (shm_rgb.buf, 3)):
-        struct.pack_into("<6I", buf, 0, MAGIC_FRAME, VERSION, W, H, bpp, NBUF)
-        struct.pack_into("<4f", buf, 40, fx, fy, cx, cy)
-    struct.pack_into("<6I", shm_pose.buf, 0, MAGIC_POSE, VERSION,
-                     MAX_PERSONS, NUM_KP, FLOATS_PER_KP, PERSON_STRIDE)
-    struct.pack_into("<4f", shm_pose.buf, 48, fx, fy, cx, cy)
+    intr = (fx, fy, cx, cy)
+    nsk.write_frame_header(shm_depth.buf, W, H, 2, NBUF, intr)
+    nsk.write_frame_header(shm_rgb.buf,   W, H, 3, NBUF, intr)
+    # In host-backend mode the pose segment belongs to pose_server: never
+    # blank its intrinsics at startup (consumers divide by fx while
+    # pose_server's committed frames are still readable). Real intrinsics
+    # from a connected camera are still shared -- pose_server copies them.
+    if POSE_SOURCE != "none" or fx != 0.0:
+        nsk.write_pose_header(shm_pose.buf, intr)
 
 
 def set_status(status):
     struct.pack_into("<2I", shm_depth.buf, 56, status, _reconnects)
     struct.pack_into("<2I", shm_rgb.buf,   56, status, _reconnects)
     struct.pack_into("<I",  shm_pose.buf,  44, status)
-
-
-def commit_frame(buf, frame_id):
-    struct.pack_into("<Qd", buf, 24, frame_id, time.time())
 
 
 # ------------------------------------------------------------- shutdown ----
@@ -307,9 +269,7 @@ def make_kp_mapper(nn_w, nn_h):
     remaps them). depthai-nodes has also flip-flopped between normalised and
     pixel coordinates; detect that once at runtime instead of trusting docs.
     """
-    scale = min(nn_w / W, nn_h / H)
-    pad_x = (nn_w - W * scale) * 0.5
-    pad_y = (nn_h - H * scale) * 0.5
+    scale, pad_x, pad_y = nsk.letterbox_transform(W, H, nn_w, nn_h)
 
     def to_frame(kp):
         global _kp_convention_logged
@@ -346,69 +306,34 @@ def make_tx_mapper(pose_tx, target_tx, nn_w, nn_h):
     return to_frame
 
 
-def depth_at(depth_frame, px, py):
-    """Median depth (metres) in a small patch; 0.0 when nothing valid."""
-    if not (np.isfinite(px) and np.isfinite(py)):
-        return 0.0          # NaN keypoint must not recycle the session
-    x, y = int(round(px)), int(round(py))
-    if not (0 <= x < W and 0 <= y < H):
-        return 0.0
-    x0, x1 = max(0, x - DEPTH_PATCH), min(W, x + DEPTH_PATCH + 1)
-    y0, y1 = max(0, y - DEPTH_PATCH), min(H, y + DEPTH_PATCH + 1)
-    patch = depth_frame[y0:y1, x0:x1]
-    valid = patch[patch > 0]
-    if valid.size == 0:
-        return 0.0
-    return float(np.median(valid)) * 0.001
-
-
 def write_pose(detections, depth_frame, frame_id, to_frame, remap=None):
     """Fill the pose segment: top MAX_PERSONS detections by confidence.
 
     `to_frame` maps a parser keypoint to full-frame pixels (letterbox undo);
     depth_frame must be in that same frame. When the NN runs on the left mono
     camera, `remap` converts (px, py, z) from the left frame into CAM_A
-    pixels + metres so the stream contract never changes.
+    pixels + metres so the stream contract never changes. Depth-edge gating
+    and serialization live in nsk.write_pose_slots.
     """
-    buf = shm_pose.buf
     dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
-    dets = dets[:MAX_PERSONS]
 
-    for slot in range(MAX_PERSONS):
-        base = HDR + slot * PERSON_STRIDE
-        if slot >= len(dets):
-            struct.pack_into("<f", buf, base, 0.0)      # empty slot
-            continue
-        det = dets[slot]
-        struct.pack_into("<4f", buf, base, det.confidence, 0.0, 0.0, 0.0)
+    persons = []
+    for det in dets[:MAX_PERSONS]:
         kps = det.getKeypoints()
-
         joints = []                          # (px, py, z, conf) per keypoint
         for i in range(NUM_KP):
             if i < len(kps):
                 px, py = to_frame(kps[i])
-                z = depth_at(depth_frame, px, py) if kps[i].confidence > 0.3 else 0.0
+                z = nsk.depth_at(depth_frame, px, py) \
+                    if kps[i].confidence > KP_CONF_MIN else 0.0
                 if remap is not None and z > 0.0:
                     px, py, z = remap(px, py, z)
                 joints.append((px, py, z, kps[i].confidence))
             else:
                 joints.append((0.0, 0.0, 0.0, 0.0))
+        persons.append((det.confidence, joints))
 
-        # Depth-edge gate: a keypoint on a silhouette boundary can sample the
-        # background instead of the person. Anything implausibly far from the
-        # person's own median depth loses its z (consumers hold last pose).
-        zs = [j[2] for j in joints if j[2] > 0.0]
-        if len(zs) >= 3:
-            ref = float(np.median(zs))
-            joints = [(px, py, z if (z == 0.0 or abs(z - ref) <= JOINT_DEV_MAX)
-                       else 0.0, c)
-                      for px, py, z, c in joints]
-
-        for i, (px, py, z, c) in enumerate(joints):
-            struct.pack_into("<4f", buf, base + 16 + i * 16, px, py, z, c)
-
-    struct.pack_into("<I", buf, 40, len(dets))
-    commit_frame(buf, frame_id)                          # commit last
+    nsk.write_pose_slots(shm_pose.buf, persons, frame_id)
 
 
 # ------------------------------------------------------------ one session ---
@@ -463,38 +388,48 @@ def stream_once(ids):
         pp.spatialFilter.holeFillingRadius = 2
         pp.spatialFilter.numIterations = 1
 
+        pose_enabled = POSE_SOURCE != "none"
         pose_on_left = POSE_SOURCE == "left"
 
-        # Resolve the model up front to learn its input size. Handing the
-        # Camera node straight to ParsingNeuralNetwork lets depthai pick the
-        # resize, and its default is a centre CROP: at 1280x800 -> 640x352
-        # that cut ~50 px off the top and bottom -- heads and ankles -- and
-        # skewed every keypoint scaled by full-frame height. An explicit
-        # LETTERBOX output keeps the whole FOV; make_kp_mapper undoes the pads.
-        desc = dai.NNModelDescription(POSE_MODEL)
-        desc.platform = pipeline.getDefaultDevice().getPlatformAsString()
-        nn_archive = dai.NNArchive(dai.getModelFromZoo(desc))
-        nn_w, nn_h = nn_archive.getInputWidth(), nn_archive.getInputHeight()
-        if not nn_w or not nn_h:
-            raise RuntimeError(f"model '{POSE_MODEL}' lacks a static input size")
-        log.info("pose model %s (input %dx%d)", POSE_MODEL, nn_w, nn_h)
-        kp_to_frame = make_kp_mapper(nn_w, nn_h)
+        nn = None
+        kp_to_frame = None
+        nn_w = nn_h = 0
+        if pose_enabled:
+            # Resolve the model up front to learn its input size. Handing the
+            # Camera node straight to ParsingNeuralNetwork lets depthai pick
+            # the resize, and its default is a centre CROP: at 1280x800 ->
+            # 640x352 that cut ~50 px off the top and bottom -- heads and
+            # ankles -- and skewed every keypoint scaled by full-frame height.
+            # An explicit LETTERBOX output keeps the whole FOV; make_kp_mapper
+            # undoes the pads.
+            desc = dai.NNModelDescription(POSE_MODEL)
+            desc.platform = pipeline.getDefaultDevice().getPlatformAsString()
+            nn_archive = dai.NNArchive(dai.getModelFromZoo(desc))
+            nn_w, nn_h = nn_archive.getInputWidth(), nn_archive.getInputHeight()
+            if not nn_w or not nn_h:
+                raise RuntimeError(f"model '{POSE_MODEL}' lacks a static input size")
+            log.info("pose model %s (input %dx%d)", POSE_MODEL, nn_w, nn_h)
+            kp_to_frame = make_kp_mapper(nn_w, nn_h)
 
-        # The RGB pose input is undistorted to match the aligned-depth grid
-        # (same as rgb_out); the left path stays raw so keypoints agree with
-        # the raw CAM_B intrinsics used by the B->A remap below.
-        pose_cam = left if pose_on_left else cam_rgb
-        pose_out = pose_cam.requestOutput(
-            (nn_w, nn_h), dai.ImgFrame.Type.BGR888i, fps=FPS,
-            resizeMode=dai.ImgResizeMode.LETTERBOX,
-            enableUndistortion=None if pose_on_left else True)
-        nn = pipeline.create(ParsingNeuralNetwork).build(pose_out, nn_archive)
+            # The RGB pose input is undistorted to match the aligned-depth
+            # grid (same as rgb_out); the left path stays raw so keypoints
+            # agree with the raw CAM_B intrinsics used by the B->A remap.
+            pose_cam = left if pose_on_left else cam_rgb
+            pose_out = pose_cam.requestOutput(
+                (nn_w, nn_h), dai.ImgFrame.Type.BGR888i, fps=FPS,
+                resizeMode=dai.ImgResizeMode.LETTERBOX,
+                enableUndistortion=None if pose_on_left else True)
+            nn = pipeline.create(ParsingNeuralNetwork).build(pose_out, nn_archive)
+        else:
+            log.info("on-device pose disabled -- pose_server.py owns the "
+                     "pose segment")
 
         # Small queues, non-blocking: we always want the newest frame, and a
         # stalled consumer must never apply back-pressure to the device.
         q_depth = align.outputAligned.createOutputQueue(maxSize=2, blocking=False)
         q_rgb   = rgb_out.createOutputQueue(maxSize=2, blocking=False)
-        q_pose  = nn.out.createOutputQueue(maxSize=2, blocking=False)
+        q_pose  = nn.out.createOutputQueue(maxSize=2, blocking=False) \
+                  if pose_enabled else None
         # Left-frame keypoints need left-frame depth: tap the raw (pre-align,
         # rectified-left) depth as well. Post-processing filters still apply.
         q_raw   = stereo.depth.createOutputQueue(maxSize=2, blocking=False) \
@@ -545,7 +480,7 @@ def stream_once(ids):
                     return 0.0, 0.0, 0.0
                 return (fxA * p[0] / p[2] + cxA,
                         fyA * p[1] / p[2] + cyA, p[2])
-        else:
+        elif pose_enabled:
             log.info("pose on RGB")
 
         set_status(STATUS_STREAMING)
@@ -566,7 +501,7 @@ def stream_once(ids):
                 ids["depth"] += 1
                 off = HDR + (ids["depth"] % NBUF) * DEPTH_SZ
                 shm_depth.buf[off:off + DEPTH_SZ] = depth_frame.tobytes()
-                commit_frame(shm_depth.buf, ids["depth"])
+                nsk.commit_frame(shm_depth.buf, ids["depth"])
                 last_frame_at = time.time()
                 got_any = True
 
@@ -584,7 +519,7 @@ def stream_once(ids):
                 off = HDR + (ids["rgb"] % NBUF) * RGB_SZ
                 shm_rgb.buf[off:off + RGB_SZ] = np.ascontiguousarray(
                     pkt.getFrame(), dtype=np.uint8).tobytes()
-                commit_frame(shm_rgb.buf, ids["rgb"])
+                nsk.commit_frame(shm_rgb.buf, ids["rgb"])
                 got_any = True
 
             if q_raw is not None:
@@ -593,7 +528,7 @@ def stream_once(ids):
                     raw_depth = np.ascontiguousarray(pkt.getFrame(), dtype=np.uint16)
                     got_any = True
 
-            pkt = q_pose.tryGet()
+            pkt = q_pose.tryGet() if q_pose is not None else None
             pose_depth = raw_depth if pose_on_left else depth_frame
             if pkt is not None and pose_depth is not None:
                 ids["pose"] += 1
@@ -633,11 +568,13 @@ def main():
     log.info("config: pose source=%s  model=%s  ir dot=%.2f flood=%.2f",
              POSE_SOURCE, POSE_MODEL, IR_DOT, IR_FLOOD)
 
+    create_segments()
     write_frame_headers()
     set_status(STATUS_STARTING)
-    commit_frame(shm_depth.buf, 0)
-    commit_frame(shm_rgb.buf, 0)
-    commit_frame(shm_pose.buf, 0)
+    nsk.commit_frame(shm_depth.buf, 0)
+    nsk.commit_frame(shm_rgb.buf, 0)
+    if POSE_SOURCE != "none":       # never stomp pose_server's commits
+        nsk.commit_frame(shm_pose.buf, 0)
 
     ids = {"depth": 0, "rgb": 0, "pose": 0}
     delay = RETRY_DELAY
@@ -672,6 +609,8 @@ if __name__ == "__main__":
         main()
     finally:
         for seg in (shm_depth, shm_rgb, shm_pose):
+            if seg is None:
+                continue
             seg.close()
             try:
                 seg.unlink()

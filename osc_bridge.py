@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
 """nice-stream pose -> OSC movement signals.
 
 Reads the 'nice_stream_pose' shared-memory segment (the only segment this
@@ -27,22 +29,20 @@ OSC namespace (floats unless noted):
 Sonic Pi: run with --port 4560; cues arrive as /osc*/nice/... (see
 sonicpi_example.rb). Debug without Sonic Pi: osc_monitor.py.
 
-Run with the venv (numpy not required, python-osc is):
+Run with the venv (python-osc required):
   .venv/Scripts/python.exe osc_bridge.py --host 127.0.0.1 --port 9000 --verbose
 """
 
 import argparse
 import math
-import struct
 import time
 from multiprocessing import shared_memory
 
 from pythonosc import osc_bundle_builder, osc_message_builder, udp_client
 
-HDR = 64
-MAGIC = 0x504B534E  # 'NSKP'
-MIN_JOINT_CONF = 0.3
-MAX_SLOTS = 8
+import nsk
+from nsk import KP_CONF_MIN as MIN_JOINT_CONF
+from nsk import MAX_PERSONS as MAX_SLOTS
 
 
 def parse_args():
@@ -67,43 +67,29 @@ def parse_args():
 
 
 def attach(name):
+    """Block until the pose segment exists and its header parses.
+
+    A producer (pose_server in particular) may create the segment well
+    before it writes the header -- an unparseable header means "not yet",
+    never "give up".
+    """
     while True:
         try:
             shm = shared_memory.SharedMemory(name=name)
-            magic, _, max_p, n_kp, _, stride = struct.unpack_from("<6I", shm.buf, 0)
-            if magic != MAGIC:
-                raise RuntimeError(f"bad magic 0x{magic:08X}")
-            K = struct.unpack_from("<4f", shm.buf, 48)
-            print(f"attached '{name}': {max_p} slots, {n_kp} kp, fx={K[0]:.1f}")
-            return shm, max_p, n_kp, stride, K
         except FileNotFoundError:
             print(f"waiting for '{name}' ...")
             time.sleep(1.0)
-
-
-def read_frame(buf, max_p, n_kp, stride):
-    """Seqlock read: pose is single-buffered; frame_id is the commit."""
-    for _ in range(4):
-        fid_before, = struct.unpack_from("<Q", buf, 24)
-        if fid_before == 0:
-            return 0, []
-        raw = bytes(buf[HDR:HDR + max_p * stride])
-        fid_after, = struct.unpack_from("<Q", buf, 24)
-        if fid_before == fid_after:
-            break
-    else:
-        return 0, []
-
-    persons = []
-    for slot in range(max_p):
-        base = slot * stride
-        conf, = struct.unpack_from("<f", raw, base)
-        if conf <= 0.0:
             continue
-        joints = [struct.unpack_from("<4f", raw, base + 16 + k * 16)
-                  for k in range(n_kp)]
-        persons.append((conf, joints))
-    return fid_after, persons
+        hdr = nsk.parse_pose_header(shm.buf)
+        if hdr is None:
+            shm.close()
+            print(f"waiting for '{name}' header ...")
+            time.sleep(1.0)
+            continue
+        K = hdr["intrinsics"]
+        print(f"attached '{name}': {hdr['max_persons']} slots, "
+              f"{hdr['num_kp']} kp, fx={K[0]:.1f}")
+        return shm, hdr["max_persons"], hdr["num_kp"], hdr["stride"], K
 
 
 def centroid_of(joints, K):
@@ -223,7 +209,7 @@ def main():
 
     print(f"emitting to {args.host}:{args.port} at <= {args.rate:.0f} Hz")
     while True:
-        fid, persons = read_frame(shm.buf, max_p, n_kp, stride)
+        fid, persons = nsk.read_pose_frame(shm.buf, max_p, n_kp, stride)
         now = time.time()
         if fid == last_fid or now - last_emit < 1.0 / args.rate:
             time.sleep(0.003)
