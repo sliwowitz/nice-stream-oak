@@ -88,11 +88,6 @@ POSE_SOURCE = os.environ.get("NICE_STREAM_POSE_SOURCE", "left")
 # heavy post-processing) at some fps cost; DEFAULT is the faster fallback.
 STEREO_PRESET = os.environ.get("NICE_STREAM_STEREO_PRESET", "HIGH_DETAIL")
 
-# 1 = skip the graceful device teardown on shutdown (dev iterations only:
-# the clean close is what protects the OAK-4 from wedging into a state that
-# needs a replug, so leave this off in production).
-FAST_EXIT = os.environ.get("NICE_STREAM_FAST_EXIT", "0") == "1"
-
 # Dev convenience: --interactive (or NICE_STREAM_INTERACTIVE=1, e.g. in a
 # PyCharm run configuration) asks for the camera profile in the terminal on
 # startup. Production runs leave this off and configure via env vars.
@@ -260,10 +255,6 @@ def _stop(signum: int, _frame: FrameType | None) -> None:
     global _running
     log.info("signal %s -- shutting down", signum)
     _running = False
-    if FAST_EXIT:
-        log.warning("FAST_EXIT: skipping graceful device teardown "
-                    "(dev only -- the camera may need a replug afterwards)")
-        os._exit(130)
 
 
 signal.signal(signal.SIGINT, _stop)
