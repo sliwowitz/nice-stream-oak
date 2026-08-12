@@ -1,0 +1,13 @@
+version = 1
+SPDX-PackageName = "nice-stream-oak"
+SPDX-PackageSupplier = "Jiří Vyskočil <jiri@vyskocil.com>"
+
+# Files that carry no comment syntax of their own (or where inline headers
+# would be noise). Everything else has SPDX headers in-file.
+# __pycache__: derived bytecode; reuse-tool doesn't honour .gitignore here
+# because this repo is a git submodule (.git is a file, not a directory).
+[[annotations]]
+path = ["README.md", ".gitignore", ".idea/**", "docs/**", "**/__pycache__/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Jiří Vyskočil <jiri@vyskocil.com>"
+SPDX-License-Identifier = "MIT"

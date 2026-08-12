@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
 """
 nice-stream-oak: depth -> shared memory.
 

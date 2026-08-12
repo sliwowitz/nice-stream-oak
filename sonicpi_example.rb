@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
 # nice-stream OSC -> sound, minimal wiring proof.
 #
 # 1. Sonic Pi 4 listens for OSC on port 4560 (Prefs > IO > "Receive remote

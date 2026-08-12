@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
 """Debug viewer for all three nice-stream segments. Esc quits.
 
 Shows RGB with skeleton overlay, and depth as a colormap. Reads the same

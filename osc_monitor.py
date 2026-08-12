@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
 """Rudimentary OSC monitor: shows the latest value per address, ~4x/second.
 
 Debugs the bridge without Sonic Pi:

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
 import struct, time
 from multiprocessing import shared_memory
 import numpy as np, cv2
