@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
+
+# Not a distributable package -- this file centralizes project metadata and
+# tool configuration for the nice-stream-oak scripts.
+[project]
+name = "nice-stream-oak"
+version = "0.1.0"
+description = "OAK-4 depth/rgb/pose to shared memory for the Nice-Stream installation"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSES/*.txt"]
+
+# The runtime venv is provisioned by hand (depthai wheels); these groups
+# cover the tooling on top of it.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "reuse>=5",
+]
+docs = [
+    # Needs Python >= 3.12; built in CI (.github/workflows/docs.yml), not
+    # in the camera venv.
+    "mkdocs-terok~=0.8.0",
+    "mkdocs-material>=9.7",
+    "mkdocstrings[python]>=0.26",
+    "mkdocs-literate-nav>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+# SPDX-License-Identifier: MIT
+
+site_name: nice-stream-oak
+site_description: OAK-4 depth/rgb/pose to shared memory for the Nice-Stream installation
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+# Minimal on purpose: only the API reference generator. This is a small
+# project and should stay one -- flip more terok generators on only when
+# something actually needs them.
+plugins:
+  - search
+  - terok:
+      ref_pages: true
+      ref_pages_skip_patterns:
+        - scratch
+        - depth_server        # superseded by stream_server, kept for history
+  - literate-nav:
+      nav_file: SUMMARY.md
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: true
+            show_root_heading: true
+
+nav:
+  - Home: index.md
+  - API Reference: reference/
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true

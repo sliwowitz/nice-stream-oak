@@ -1,2 +1,6 @@
 /depth_server.log
 /stream_server.log
+__pycache__/
+*.pyc
+.venv-docs/
+/pose_server.log
