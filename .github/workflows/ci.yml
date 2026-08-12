@@ -8,21 +8,43 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # Pins match the camera venv; bump together with it. depthai-nodes pulls
+  # depthai + opencv-headless + numpy. python-osc is typed (py.typed), so
+  # installing it lets mypy really check osc_bridge.py.
+  RUNTIME_DEPS: depthai==3.8.0 depthai-nodes==0.6.0 python-osc==1.10.2
+
 jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install "ruff~=0.16.0"
+      - run: ruff check .
+
+  mypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install $RUNTIME_DEPS mypy
+      - run: mypy
+
   tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          # Matches the camera venv; bump together with it.
+          # Matches the camera venv; no camera is needed -- the suite tests
+          # the wire contract, letterbox maths and interactive config.
           python-version: "3.11"
-      # Pins match the venv. depthai-nodes pulls depthai + opencv-headless +
-      # numpy; no camera is needed -- the suite tests the wire contract, the
-      # letterbox maths and the interactive config, all host-side.
-      - run: pip install depthai==3.8.0 depthai-nodes==0.6.0 pytest "ruff~=0.16.0" mypy
-      - run: ruff check .
-      - run: mypy
+      - run: pip install $RUNTIME_DEPS pytest
       - run: pytest
 
   reuse:
