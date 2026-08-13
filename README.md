@@ -24,6 +24,8 @@ publishes depth, RGB and pose frames into shared memory for the Unity side.
   (Sonic Pi etc.; see `sonicpi_example.rb`).
 - `osc_monitor.py` — terminal OSC monitor; debugs the bridge without
   Sonic Pi.
+- `oscii_bot_example.txt` — OSC-to-MIDI recipe for OSCII-bot; turns the
+  bridge's stream into CCs and notes for MIDI-only gear (see `docs/osc.md`).
 - `calib_capture.py` — grabs rgb frames from the running stream into a zip
   that HubAI accepts as INT8 quantization-calibration data.
 

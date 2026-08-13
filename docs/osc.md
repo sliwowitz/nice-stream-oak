@@ -39,5 +39,13 @@ them.
 another machine, enable *Receive remote OSC messages* in Preferences →
 IO.
 
+**MIDI:** the stream converts to MIDI client-side, without touching the
+wire format — `oscii_bot_example.txt` is a ready recipe for
+[OSCII-bot](https://www.cockos.com/oscii-bot/) (group signals as CCs on
+channel 1, one channel per person slot, entered/left as notes; ranges
+tunable at the top of the script). Point a dedicated bridge instance at
+it (`--port 9001`); running several bridges to different targets is
+fine — the bridge only sends.
+
 The authoritative definition is the module docstring of
 `osc_bridge.py`; if this page disagrees, the docstring wins.
