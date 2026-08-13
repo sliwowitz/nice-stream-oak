@@ -38,7 +38,7 @@ import depthai as dai
 import numpy as np
 
 # ---------------------------------------------------------------- config ----
-SHM_NAME  = os.environ.get("NICE_STREAM_SHM", "nice_stream_depth")
+SHM_NAME  = os.environ.get("NICE_STREAM_SHM_DEPTH", "nice_stream_depth")
 W, H      = 1280, 800
 BPP       = 2
 NBUF      = 3                       # 3 avoids a reader ever meeting the writer

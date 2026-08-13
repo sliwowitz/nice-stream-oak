@@ -10,7 +10,7 @@ cloud + skeletons) and an OSC bridge.
 | --- | --- |
 | `stream_server.py` | Camera server: depth + rgb (+ optionally on-device pose) → SHM. `--interactive` for a startup profile/model picker. |
 | `pose_server.py` | Optional host-side pose backend (RTMO on the GPU). Pair with `NICE_STREAM_POSE_SOURCE=none`. |
-| `osc_bridge.py` | Pose segment → `/nice/*` OSC movement signals (Sonic Pi etc.). |
+| `osc_bridge.py` | Pose segment → [`/nice/*` OSC movement signals](osc.md) (Sonic Pi etc.). |
 
 The shared-memory wire contract (NSK1 frame segments, NSKP pose segment)
 lives in `nsk.py` — the single source of truth, mirrored by the Unity

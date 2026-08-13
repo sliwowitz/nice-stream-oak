@@ -1,11 +1,13 @@
-OAK bridge for Point Clouds and Skeletons
+# nice-stream-oak
+
+OAK bridge for point clouds and skeletons: reads an OAK-4 camera and
+publishes depth, RGB and pose frames into shared memory for the Unity side.
 
 ## Processes
 
-- `stream_server.py` — the camera server: depth + rgb (+ optionally pose)
-  into shared memory. Run with `--interactive` (or
-  `NICE_STREAM_INTERACTIVE=1` in the PyCharm run config) for a terminal
-  profile/model picker on startup.
+- `stream_server.py` — the camera server: depth + rgb + pose into shared
+  memory. Run with `--interactive` (or `NICE_STREAM_INTERACTIVE=1` in the
+  PyCharm run config) for a terminal profile/model picker on startup.
 - `pose_server.py` — optional host-side pose backend (RTMO on the GPU,
   higher quality than the on-device YOLO). Run stream_server with
   `NICE_STREAM_POSE_SOURCE=none` (interactive profile `[3]`), then this
@@ -15,10 +17,15 @@ OAK bridge for Point Clouds and Skeletons
       pip install "onnxruntime-gpu[cuda,cudnn]"
       pip install --no-deps rtmlib tqdm
 
-  Model via `NICE_STREAM_RTMO_MODEL` = `s` | `m` (default) | `l`.
-  Watch the startup log for `onnxruntime providers:` — if
+  Model via `NICE_STREAM_RTMO_MODEL` = `s` | `m` (default) | `l` | a path
+  or URL. Watch the startup log for `onnxruntime providers:` — if
   CUDAExecutionProvider is missing it fell back to CPU.
-- `osc_bridge.py` — pose segment -> OSC movement signals (Sonic Pi etc.).
+- `osc_bridge.py` — pose segment -> OSC movement signals under `/nice/...`
+  (Sonic Pi etc.; see `sonicpi_example.rb`).
+- `osc_monitor.py` — terminal OSC monitor; debugs the bridge without
+  Sonic Pi.
+- `calib_capture.py` — grabs rgb frames from the running stream into a zip
+  that HubAI accepts as INT8 quantization-calibration data.
 
 Pose backends write the identical NSKP contract, so they are freely
 swappable per run; the on-device YOLO path stays the default. The wire
@@ -85,7 +92,7 @@ licensed to run only on Luxonis hardware.
 
 ## Hardware notes
 
-For testing OAK4, download OAK Viewer.
-If it doesn't show up even if connected and LED is up
-static blue, try reset (use SIM tool on the back button, hold for 5s).
-OAK Viewer should pick it up afterwards.
+To test the OAK-4 outside this project, use OAK Viewer. If the camera does
+not show up even though it is connected and its LED is static blue, reset
+it: hold the button on the back with a SIM tool for 5 s. OAK Viewer picks
+it up afterwards.

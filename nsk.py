@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
 # SPDX-License-Identifier: MIT
-"""nice-stream shared-memory wire contract -- the single source of truth.
+"""Defines the nice-stream shared-memory wire contract -- the single source of truth.
 
 Two segment kinds, both little endian, both with a 64-byte header whose
 frame id at offset 24 is written last and acts as the commit.
@@ -60,6 +60,28 @@ from typing import TypedDict
 import numpy as np
 import numpy.typing as npt
 
+HEADER_SIZE = 64
+MAGIC_FRAME = 0x314B534E            # 'NSK1'
+MAGIC_POSE  = 0x504B534E            # 'NSKP'
+VERSION     = 1
+
+MAX_PERSONS   = 8
+NUM_KP        = 17
+FLOATS_PER_KP = 4
+PERSON_STRIDE = 16 + NUM_KP * FLOATS_PER_KP * 4     # 288 bytes
+POSE_SZ       = HEADER_SIZE + MAX_PERSONS * PERSON_STRIDE
+
+STATUS_STARTING     = 0
+STATUS_STREAMING    = 1
+STATUS_RECONNECTING = 2
+
+# Depth-lift rules shared by every pose producer.
+DEPTH_PATCH   = 2                   # median over (2k+1)^2 px per keypoint
+JOINT_DEV_MAX = 1.5                 # m; a joint further than this from the
+                                    # person's median depth sampled the
+                                    # background -- its z is dropped
+KP_CONF_MIN   = 0.3                 # keypoints below this get no depth lift
+
 # A writable view of a shared-memory segment (or a bytearray in tests).
 Buf = bytearray | memoryview
 
@@ -94,29 +116,6 @@ class PoseHeader(TypedDict):
     intrinsics: Intrinsics
 
 
-HDR         = 64
-MAGIC_FRAME = 0x314B534E            # 'NSK1'
-MAGIC_POSE  = 0x504B534E            # 'NSKP'
-VERSION     = 1
-
-MAX_PERSONS   = 8
-NUM_KP        = 17
-FLOATS_PER_KP = 4
-PERSON_STRIDE = 16 + NUM_KP * FLOATS_PER_KP * 4     # 288 bytes
-POSE_SZ       = HDR + MAX_PERSONS * PERSON_STRIDE
-
-STATUS_STARTING     = 0
-STATUS_STREAMING    = 1
-STATUS_RECONNECTING = 2
-
-# Depth-lift rules shared by every pose producer.
-DEPTH_PATCH   = 2                   # median over (2k+1)^2 px per keypoint
-JOINT_DEV_MAX = 1.5                 # m; a joint further than this from the
-                                    # person's median depth sampled the
-                                    # background -- its z is dropped
-KP_CONF_MIN   = 0.3                 # keypoints below this get no depth lift
-
-
 # ------------------------------------------------------------ segments ------
 def open_segment(name: str, size: int) -> tuple[shared_memory.SharedMemory, bool]:
     """Create-or-attach, so producer/consumer start order never matters.
@@ -132,21 +131,21 @@ def open_segment(name: str, size: int) -> tuple[shared_memory.SharedMemory, bool
 # -------------------------------------------------------------- headers -----
 def write_frame_header(buf: Buf, w: int, h: int, bpp: int, nbuf: int,
                        intrinsics: Intrinsics = (0.0, 0.0, 0.0, 0.0)) -> None:
-    """Layout + intrinsics of an NSK1 segment; commit/status are separate."""
+    """Write layout + intrinsics of an NSK1 segment; commit/status are separate."""
     struct.pack_into("<6I", buf, 0, MAGIC_FRAME, VERSION, w, h, bpp, nbuf)
     struct.pack_into("<4f", buf, 40, *intrinsics)
 
 
 def write_pose_header(buf: Buf,
                       intrinsics: Intrinsics = (0.0, 0.0, 0.0, 0.0)) -> None:
-    """Layout + intrinsics of the NSKP segment; commit/status are separate."""
+    """Write layout + intrinsics of the NSKP segment; commit/status are separate."""
     struct.pack_into("<6I", buf, 0, MAGIC_POSE, VERSION,
                      MAX_PERSONS, NUM_KP, FLOATS_PER_KP, PERSON_STRIDE)
     struct.pack_into("<4f", buf, 48, *intrinsics)
 
 
 def parse_frame_header(buf: Buf) -> FrameHeader | None:
-    """Parsed NSK1 header dict, or None while the producer hasn't written it."""
+    """Parse the NSK1 header; None while the producer hasn't written it."""
     magic, version, w, h, bpp, nbuf = struct.unpack_from("<6I", buf, 0)
     if magic != MAGIC_FRAME or w == 0 or h == 0 or nbuf == 0:
         return None
@@ -155,7 +154,7 @@ def parse_frame_header(buf: Buf) -> FrameHeader | None:
 
 
 def parse_pose_header(buf: Buf) -> PoseHeader | None:
-    """Parsed NSKP header dict, or None on bad magic / implausible layout."""
+    """Parse the NSKP header; None on bad magic / implausible layout."""
     magic, version, max_p, n_kp, fpk, stride = struct.unpack_from("<6I", buf, 0)
     if magic != MAGIC_POSE or not (0 < max_p <= 64) or n_kp <= 0:
         return None
@@ -171,11 +170,11 @@ def commit_frame(buf: Buf, frame_id: int, timestamp: float | None = None) -> Non
 
 
 # ------------------------------------------------------------ frame reads ---
-def newest_frame(buf: Buf, hdr: FrameHeader, dtype: npt.DTypeLike,
-                 channels: int, skip_id: int | None = None,
-                 ) -> tuple[npt.NDArray | None, int]:
-    """Copy of the newest committed NSK1 frame + its id; (None, fid) when
-    there is nothing new or no untorn copy could be taken.
+def read_newest_frame(buf: Buf, hdr: FrameHeader, dtype: npt.DTypeLike,
+                      channels: int, skip_id: int | None = None,
+                      ) -> tuple[npt.NDArray | None, int]:
+    """Return a copy of the newest committed NSK1 frame and its id, or
+    (None, fid) when there is nothing new or no untorn copy could be taken.
 
     skip_id: return early -- before the multi-MB copy -- when the committed
     id hasn't changed, so an idle poll costs a header read, nothing more.
@@ -194,7 +193,7 @@ def newest_frame(buf: Buf, hdr: FrameHeader, dtype: npt.DTypeLike,
         (fid,) = struct.unpack_from("<Q", buf, 24)
         if fid == 0 or fid == skip_id:
             return None, fid
-        off = HDR + (fid % nbuf) * frame_sz
+        off = HEADER_SIZE + (fid % nbuf) * frame_sz
         arr = np.frombuffer(buf, dtype=dtype, count=count, offset=off)
         arr = arr.reshape((h, w, channels) if channels > 1 else (h, w)).copy()
         (fid2,) = struct.unpack_from("<Q", buf, 24)
@@ -205,7 +204,7 @@ def newest_frame(buf: Buf, hdr: FrameHeader, dtype: npt.DTypeLike,
 
 def read_pose_frame(buf: Buf, max_p: int, n_kp: int,
                     stride: int) -> tuple[int, list[Person]]:
-    """Seqlock read of the single-buffered pose segment.
+    """Read the single-buffered pose segment with seqlock retries.
 
     Returns (frame_id, [(confidence, [(px, py, z, conf)] * n_kp)]); empty
     slots are skipped. (0, []) while nothing is committed or under
@@ -215,7 +214,7 @@ def read_pose_frame(buf: Buf, max_p: int, n_kp: int,
         (fid_before,) = struct.unpack_from("<Q", buf, 24)
         if fid_before == 0:
             return 0, []
-        raw = bytes(buf[HDR:HDR + max_p * stride])
+        raw = bytes(buf[HEADER_SIZE:HEADER_SIZE + max_p * stride])
         (fid_after,) = struct.unpack_from("<Q", buf, 24)
         if fid_before == fid_after:
             break
@@ -236,8 +235,9 @@ def read_pose_frame(buf: Buf, max_p: int, n_kp: int,
 
 # ------------------------------------------------------------ depth lift ----
 def depth_at(depth: npt.NDArray[np.uint16], px: float, py: float) -> float:
-    """Median depth (metres) in a small patch of a u16-mm map; 0.0 when
-    nothing valid (out of bounds, NaN coordinates, or an empty patch)."""
+    """Sample the median depth (metres) in a small patch of a u16-mm map;
+    0.0 when nothing valid (out of bounds, NaN coordinates, or an empty
+    patch)."""
     if not (np.isfinite(px) and np.isfinite(py)):
         return 0.0          # a NaN keypoint must not kill the producer
     h, w = depth.shape
@@ -279,7 +279,7 @@ def write_pose_slots(buf: Buf, persons: Sequence[Person], frame_id: int,
     """
     persons = persons[:MAX_PERSONS]
     for slot in range(MAX_PERSONS):
-        base = HDR + slot * PERSON_STRIDE
+        base = HEADER_SIZE + slot * PERSON_STRIDE
         if slot >= len(persons):
             struct.pack_into("<f", buf, base, 0.0)      # empty slot
             continue
@@ -295,7 +295,7 @@ def write_pose_slots(buf: Buf, persons: Sequence[Person], frame_id: int,
 # -------------------------------------------------------------- letterbox ---
 def letterbox_transform(src_w: float, src_h: float, dst_w: float,
                         dst_h: float) -> tuple[float, float, float]:
-    """(scale, pad_x, pad_y) placing a src frame centred into dst:
+    """Return (scale, pad_x, pad_y) placing a src frame centred into dst:
     dst = src * scale + pad. Invert to map detections back to src pixels."""
     scale = min(dst_w / src_w, dst_h / src_h)
     return scale, (dst_w - src_w * scale) * 0.5, (dst_h - src_h * scale) * 0.5

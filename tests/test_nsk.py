@@ -63,12 +63,12 @@ def test_pose_write_marks_empty_slots():
 
 
 def test_frame_header_roundtrip():
-    buf = bytearray(nsk.HDR)
+    buf = bytearray(nsk.HEADER_SIZE)
     nsk.write_frame_header(buf, 1280, 800, 2, 3, (1.0, 2.0, 3.0, 4.0))
     hdr = nsk.parse_frame_header(buf)
     assert (hdr["w"], hdr["h"], hdr["bpp"], hdr["nbuf"]) == (1280, 800, 2, 3)
     assert hdr["intrinsics"] == pytest.approx((1.0, 2.0, 3.0, 4.0))
-    assert nsk.parse_frame_header(bytearray(nsk.HDR)) is None    # unwritten
+    assert nsk.parse_frame_header(bytearray(nsk.HEADER_SIZE)) is None    # unwritten
 
 
 def test_depth_at_rules():
@@ -110,18 +110,18 @@ def test_letterbox_transform():
 
 
 class RingSegment:
-    """NSK1-shaped buffer for driving nsk.newest_frame in-process. Races are
+    """NSK1-shaped buffer for driving nsk.read_newest_frame in-process. Races are
     simulated by patching np.frombuffer (the copy step) to mutate the commit
     id -- exactly the window a real producer would race in."""
 
     def __init__(self, w=4, h=2, nbuf=3, itemsize=1):
         self.frame_sz = w * h * itemsize
-        self.data = bytearray(nsk.HDR + nbuf * self.frame_sz)
+        self.data = bytearray(nsk.HEADER_SIZE + nbuf * self.frame_sz)
         nsk.write_frame_header(self.data, w, h, itemsize, nbuf)
         self.hdr = nsk.parse_frame_header(self.data)
 
     def commit(self, fid, fill):
-        off = nsk.HDR + (fid % self.hdr["nbuf"]) * self.frame_sz
+        off = nsk.HEADER_SIZE + (fid % self.hdr["nbuf"]) * self.frame_sz
         self.data[off:off + self.frame_sz] = bytes([fill]) * self.frame_sz
         struct.pack_into("<Q", self.data, 24, fid)
 
@@ -143,15 +143,15 @@ def racing_producer(monkeypatch, seg, advance):
     monkeypatch.setattr(nsk.np, "frombuffer", frombuffer)
 
 
-def test_newest_frame_reads_committed():
+def test_read_newest_frame_reads_committed():
     seg = RingSegment()
-    assert nsk.newest_frame(seg.buf, seg.hdr, np.uint8, 1) == (None, 0)
+    assert nsk.read_newest_frame(seg.buf, seg.hdr, np.uint8, 1) == (None, 0)
     seg.commit(7, fill=99)
-    frame, fid = nsk.newest_frame(seg.buf, seg.hdr, np.uint8, 1)
+    frame, fid = nsk.read_newest_frame(seg.buf, seg.hdr, np.uint8, 1)
     assert fid == 7 and frame.ravel().tolist() == [99] * 8
 
 
-def test_newest_frame_skip_id_short_circuits(monkeypatch):
+def test_read_newest_frame_skip_id_short_circuits(monkeypatch):
     seg = RingSegment()
     seg.commit(7, fill=99)
 
@@ -159,32 +159,32 @@ def test_newest_frame_skip_id_short_circuits(monkeypatch):
         raise AssertionError("copied a frame despite skip_id")
 
     monkeypatch.setattr(nsk.np, "frombuffer", boom)
-    frame, fid = nsk.newest_frame(seg.buf, seg.hdr, np.uint8, 1, skip_id=7)
+    frame, fid = nsk.read_newest_frame(seg.buf, seg.hdr, np.uint8, 1, skip_id=7)
     assert frame is None and fid == 7
 
 
-def test_newest_frame_tolerates_slow_producer(monkeypatch):
+def test_read_newest_frame_tolerates_slow_producer(monkeypatch):
     # id advancing by 1 during the copy leaves our slot untouched
     # (nbuf=3: the +1 frame lands in a different buffer) -- accept.
     seg = RingSegment()
     seg.commit(6, fill=1)
     racing_producer(monkeypatch, seg, advance=1)
-    frame, fid = nsk.newest_frame(seg.buf, seg.hdr, np.uint8, 1)
+    frame, fid = nsk.read_newest_frame(seg.buf, seg.hdr, np.uint8, 1)
     assert frame is not None and fid == 6
 
 
-def test_newest_frame_rejects_torn_copy(monkeypatch):
+def test_read_newest_frame_rejects_torn_copy(monkeypatch):
     # While frame fid+nbuf is being written over our slot, the committed id
     # is fid+nbuf-1: a delta of nbuf-1 must be treated as torn. With the
     # producer racing every attempt, all 3 retries fail -> (None, fid).
     seg = RingSegment()
     seg.commit(6, fill=1)
     racing_producer(monkeypatch, seg, advance=2)     # nbuf - 1
-    frame, _ = nsk.newest_frame(seg.buf, seg.hdr, np.uint8, 1)
+    frame, _ = nsk.read_newest_frame(seg.buf, seg.hdr, np.uint8, 1)
     assert frame is None
 
 
-def test_newest_frame_rejects_id_reset(monkeypatch):
+def test_read_newest_frame_rejects_id_reset(monkeypatch):
     # Producer relaunch resets ids mid-copy; the stale huge-id frame must
     # never be returned as valid.
     seg = RingSegment()
@@ -200,5 +200,5 @@ def test_newest_frame_rejects_id_reset(monkeypatch):
         return arr
 
     monkeypatch.setattr(nsk.np, "frombuffer", frombuffer)
-    frame, fid = nsk.newest_frame(seg.buf, seg.hdr, np.uint8, 1)
+    frame, fid = nsk.read_newest_frame(seg.buf, seg.hdr, np.uint8, 1)
     assert frame is None or fid != 1_000_000

@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
 # SPDX-License-Identifier: MIT
-"""
-nice-stream host-side pose backend: RTMO (one-stage multi-person) on the GPU.
+"""Runs RTMO (one-stage multi-person pose) on the host GPU and writes pose SHM.
 
 Optional, higher-quality alternative to the on-device YOLO path:
 
@@ -53,7 +52,7 @@ import nsk
 from nsk import KP_CONF_MIN, MAX_PERSONS, NUM_KP
 
 # ---------------------------------------------------------------- config ----
-SHM_DEPTH = os.environ.get("NICE_STREAM_SHM", "nice_stream_depth")
+SHM_DEPTH = os.environ.get("NICE_STREAM_SHM_DEPTH", "nice_stream_depth")
 SHM_RGB   = "nice_stream_rgb"
 SHM_POSE  = "nice_stream_pose"
 
@@ -94,47 +93,122 @@ signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
 
 
-# ------------------------------------------------------------ shared mem ----
-def try_attach(name: str) -> shared_memory.SharedMemory | None:
-    """Attach to an existing segment; None while the producer hasn't made it."""
-    try:
-        return shared_memory.SharedMemory(name=name)
-    except FileNotFoundError:
-        return None
+# ------------------------------------------------------------------ main ----
+def main() -> None:
+    """Attach to stream_server's segments and run the inference loop."""
+    model = load_rtmo()
 
+    rgb = depth = None                       # (SharedMemory, memoryview) pairs
+    pose, created = nsk.open_segment(SHM_POSE, nsk.POSE_SZ)
+    pose_buf = cast(memoryview, pose.buf)
+    log.info("%s pose segment '%s'",
+             "created" if created else "attached to", SHM_POSE)
+    last_rgb_id = 0
+    pose_id = 0
+    interval = 1.0 / POSE_FPS if POSE_FPS > 0 else 0.0
+    next_infer = 0.0
+    next_writer_warn = 0.0
+    last_foreign_id = None
+    fps_n, fps_t0 = 0, time.time()
+    waiting_logged = False
 
-def ensure_pose_header(pose_buf: nsk.Buf, rgb_hdr: nsk.FrameHeader) -> None:
-    """Write the NSKP header if nobody has. stream_server rewrites it (same
-    values, real intrinsics) whenever the camera connects; never fight it."""
-    hdr = nsk.parse_pose_header(pose_buf)
-    if hdr is not None:
-        return
-    nsk.write_pose_header(pose_buf, rgb_hdr["intrinsics"])
-    log.info("wrote pose header (intrinsics from rgb segment)")
+    while _running:
+        try:
+            # Attach producer segments as they appear; survive their absence.
+            if rgb is None:
+                rgb = try_attach_segment(SHM_RGB)
+            if depth is None:
+                depth = try_attach_segment(SHM_DEPTH)
+            if rgb is None or depth is None:
+                if not waiting_logged:
+                    log.info("waiting for stream_server segments ...")
+                    waiting_logged = True
+                time.sleep(0.5)
+                continue
 
+            rgb_hdr = nsk.parse_frame_header(rgb[1])
+            depth_hdr = nsk.parse_frame_header(depth[1])
+            if rgb_hdr is None or depth_hdr is None:
+                if not waiting_logged:
+                    log.info("segments present, waiting for camera ...")
+                    waiting_logged = True
+                time.sleep(0.5)
+                continue
+            waiting_logged = False
+            ensure_pose_header(pose_buf, rgb_hdr)
+            now = time.time()
 
-# ------------------------------------------------------------- pose write ---
-def build_persons(rtmo_persons: Sequence[tuple[npt.NDArray[Any], npt.NDArray[Any]]],
-                  depth: npt.NDArray[np.uint16]) -> list[nsk.Person]:
-    """RTMO output -> nsk person tuples: depth-lift each keypoint. The edge
-    gate and serialization live in nsk.write_pose_slots.
+            # Dual-writer watchdog: every id in this segment should be one
+            # we committed; a stream_server running with its default
+            # POSE_SOURCE would interleave ids silently. Edge-triggered on
+            # the foreign id: a relaunch's one-shot id-0 reset warns once, a
+            # LIVE second writer (ids keep changing) re-warns every 10 s.
+            if pose_id > 0 and now >= next_writer_warn:
+                # Committed frame id (nsk.commit_frame's field).
+                (cur_id,) = struct.unpack_from("<Q", pose_buf, 24)
+                if cur_id == pose_id:
+                    last_foreign_id = None
+                elif cur_id != last_foreign_id:
+                    log.warning("pose segment written by ANOTHER process "
+                                "(id %d, ours %d) -- device NN still on? "
+                                "Restart stream_server with "
+                                "NICE_STREAM_POSE_SOURCE=none.",
+                                cur_id, pose_id)
+                    last_foreign_id = cur_id
+                    next_writer_warn = now + 10.0
 
-    rtmo_persons: list of (kpts (17, 2) full-frame px, scores (17,)).
-    """
-    persons = []
-    for kpts, scores in rtmo_persons:
-        joints = []
-        for i in range(NUM_KP):
-            px, py = float(kpts[i, 0]), float(kpts[i, 1])
-            conf = float(scores[i])
-            z = nsk.depth_at(depth, px, py) if conf > KP_CONF_MIN else 0.0
-            joints.append((px, py, z, conf))
-        persons.append((float(np.mean(scores)), joints))
-    return persons
+            if now < next_infer:
+                time.sleep(min(next_infer - now, 0.005))
+                continue
+
+            frame, fid = nsk.read_newest_frame(rgb[1], rgb_hdr,
+                                               np.uint8, 3, skip_id=last_rgb_id)
+            if frame is None:
+                time.sleep(0.002)
+                continue
+            last_rgb_id = fid
+            next_infer = max(next_infer + interval, now)
+
+            # Segment holds RGB888; rtmlib/RTMO expects BGR (cv2 convention).
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            kpts, scores = model(bgr)
+
+            # rtmlib returns one all-zero person when nothing was found.
+            persons = [(k, s) for k, s in zip(kpts, scores, strict=True)
+                       if s.max() > 0.0]
+            persons.sort(key=lambda p: float(np.mean(p[1])), reverse=True)
+            persons = persons[:MAX_PERSONS]
+
+            depth_frame, _ = nsk.read_newest_frame(depth[1], depth_hdr,
+                                                   np.uint16, 1)
+            if depth_frame is None:
+                continue                     # no depth yet: hold last pose
+
+            pose_id += 1
+            nsk.write_pose_slots(pose_buf,
+                                 build_persons(persons, depth_frame), pose_id)
+
+            fps_n += 1
+            if fps_n >= 60:
+                log.info("%.1f pose fps (%d persons)",
+                         fps_n / (time.time() - fps_t0), len(persons))
+                fps_n, fps_t0 = 0, time.time()
+
+        except Exception as exc:
+            log.error("pose iteration failed: %s", exc)
+            time.sleep(1.0)
+
+    # Close only -- lifecycle (unlink) belongs to stream_server.
+    for pair in (rgb, depth):
+        if pair is not None:
+            pair[0].close()
+    pose.close()
+    log.info("stopped after %d pose frames", pose_id)
 
 
 # ----------------------------------------------------------------- model ----
-def make_model() -> Any:
+def load_rtmo() -> Any:
+    """Load RTMO via rtmlib and check the requested ORT provider is active."""
     try:
         import onnxruntime as ort
     except ImportError:
@@ -173,130 +247,47 @@ def make_model() -> Any:
     return model
 
 
-# ------------------------------------------------------------------ main ----
-def warn_if_other_writer(pose_buf: nsk.Buf) -> None:
-    """Two pose writers interleave frame ids and Unity sees garbage. If the
-    id advances while we watch, the device NN is still on -- restart
-    stream_server with NICE_STREAM_POSE_SOURCE=none."""
-    (id0,) = struct.unpack_from("<Q", pose_buf, 24)
-    time.sleep(1.0)
-    (id1,) = struct.unpack_from("<Q", pose_buf, 24)
-    if id1 != id0:
-        log.warning("ANOTHER pose writer is active (frame id %d -> %d)! "
-                    "Run stream_server with NICE_STREAM_POSE_SOURCE=none.",
-                    id0, id1)
+# ------------------------------------------------------------ shared mem ----
+def try_attach_segment(name: str,
+                       ) -> tuple[shared_memory.SharedMemory, memoryview] | None:
+    """Attach to an existing segment; None while the producer hasn't made it.
+    Returns the segment together with its buffer, bound once -- the memoryview
+    stays valid for the segment's whole lifetime."""
+    try:
+        seg = shared_memory.SharedMemory(name=name)
+        return seg, cast(memoryview, seg.buf)
+    except FileNotFoundError:
+        return None
 
 
-def main() -> None:
-    model = make_model()
+def ensure_pose_header(pose_buf: nsk.Buf, rgb_hdr: nsk.FrameHeader) -> None:
+    """Write the NSKP header if nobody has. stream_server rewrites it (same
+    values, real intrinsics) whenever the camera connects; never fight it."""
+    hdr = nsk.parse_pose_header(pose_buf)
+    if hdr is not None:
+        return
+    nsk.write_pose_header(pose_buf, rgb_hdr["intrinsics"])
+    log.info("wrote pose header (intrinsics from rgb segment)")
 
-    shm_rgb = shm_depth = None
-    pose, created = nsk.open_segment(SHM_POSE, nsk.POSE_SZ)
-    log.info("%s pose segment '%s'",
-             "created" if created else "attached to", SHM_POSE)
-    warn_if_other_writer(cast(memoryview, pose.buf))
-    rgb_hdr = depth_hdr = None
-    last_rgb_id = 0
-    pose_id = 0
-    interval = 1.0 / POSE_FPS if POSE_FPS > 0 else 0.0
-    next_infer = 0.0
-    next_writer_warn = 0.0
-    last_foreign_id = None
-    fps_n, fps_t0 = 0, time.time()
-    waiting_logged = False
 
-    while _running:
-        try:
-            # Attach producer segments as they appear; survive their absence.
-            if shm_rgb is None:
-                shm_rgb = try_attach(SHM_RGB)
-            if shm_depth is None:
-                shm_depth = try_attach(SHM_DEPTH)
-            if shm_rgb is None or shm_depth is None:
-                if not waiting_logged:
-                    log.info("waiting for stream_server segments ...")
-                    waiting_logged = True
-                time.sleep(0.5)
-                continue
+# ------------------------------------------------------------- pose write ---
+def build_persons(rtmo_persons: Sequence[tuple[npt.NDArray[Any], npt.NDArray[Any]]],
+                  depth: npt.NDArray[np.uint16]) -> list[nsk.Person]:
+    """Turn RTMO output into nsk person tuples, depth-lifting each keypoint.
 
-            rgb_hdr = nsk.parse_frame_header(cast(memoryview, shm_rgb.buf))
-            depth_hdr = nsk.parse_frame_header(cast(memoryview, shm_depth.buf))
-            if rgb_hdr is None or depth_hdr is None:
-                if not waiting_logged:
-                    log.info("segments present, waiting for camera ...")
-                    waiting_logged = True
-                time.sleep(0.5)
-                continue
-            waiting_logged = False
-            ensure_pose_header(cast(memoryview, pose.buf), rgb_hdr)
-            now = time.time()
-
-            # Dual-writer watchdog: every id in this segment should be one
-            # we committed. The startup check only covers a 1 s window; a
-            # stream_server relaunched later with its default POSE_SOURCE
-            # would interleave silently without this. Edge-triggered on the
-            # foreign id: a relaunch's one-shot id-0 reset warns once, a
-            # LIVE second writer (ids keep changing) re-warns every 10 s.
-            if pose_id > 0 and now >= next_writer_warn:
-                (cur_id,) = struct.unpack_from("<Q",
-                                               cast(memoryview, pose.buf), 24)
-                if cur_id == pose_id:
-                    last_foreign_id = None
-                elif cur_id != last_foreign_id:
-                    log.warning("pose segment written by ANOTHER process "
-                                "(id %d, ours %d) -- device NN still on? "
-                                "Restart stream_server with "
-                                "NICE_STREAM_POSE_SOURCE=none.",
-                                cur_id, pose_id)
-                    last_foreign_id = cur_id
-                    next_writer_warn = now + 10.0
-
-            if now < next_infer:
-                time.sleep(min(next_infer - now, 0.005))
-                continue
-
-            frame, fid = nsk.newest_frame(cast(memoryview, shm_rgb.buf), rgb_hdr,
-                                          np.uint8, 3, skip_id=last_rgb_id)
-            if frame is None:
-                time.sleep(0.002)
-                continue
-            last_rgb_id = fid
-            next_infer = max(next_infer + interval, now)
-
-            # Segment holds RGB888; rtmlib/RTMO expects BGR (cv2 convention).
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            kpts, scores = model(bgr)
-
-            # rtmlib returns one all-zero person when nothing was found.
-            persons = [(k, s) for k, s in zip(kpts, scores, strict=True)
-                       if s.max() > 0.0]
-            persons.sort(key=lambda p: float(np.mean(p[1])), reverse=True)
-            persons = persons[:MAX_PERSONS]
-
-            depth, _ = nsk.newest_frame(cast(memoryview, shm_depth.buf),
-                                        depth_hdr, np.uint16, 1)
-            if depth is None:
-                continue                     # no depth yet: hold last pose
-
-            pose_id += 1
-            nsk.write_pose_slots(cast(memoryview, pose.buf),
-                                 build_persons(persons, depth), pose_id)
-
-            fps_n += 1
-            if fps_n >= 60:
-                log.info("%.1f pose fps (%d persons)",
-                         fps_n / (time.time() - fps_t0), len(persons))
-                fps_n, fps_t0 = 0, time.time()
-
-        except Exception as exc:
-            log.error("pose iteration failed: %s", exc)
-            time.sleep(1.0)
-
-    # Close only -- lifecycle (unlink) belongs to stream_server.
-    for seg in (shm_rgb, shm_depth, pose):
-        if seg is not None:
-            seg.close()
-    log.info("stopped after %d pose frames", pose_id)
+    rtmo_persons: list of (kpts (17, 2) full-frame px, scores (17,)).
+    The edge gate and serialization live in nsk.write_pose_slots.
+    """
+    persons = []
+    for kpts, scores in rtmo_persons:
+        joints = []
+        for i in range(NUM_KP):
+            px, py = float(kpts[i, 0]), float(kpts[i, 1])
+            conf = float(scores[i])
+            z = nsk.depth_at(depth, px, py) if conf > KP_CONF_MIN else 0.0
+            joints.append((px, py, z, conf))
+        persons.append((float(np.mean(scores)), joints))
+    return persons
 
 
 if __name__ == "__main__":

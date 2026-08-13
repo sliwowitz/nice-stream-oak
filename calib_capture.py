@@ -4,9 +4,9 @@
 
 Quantization is only as good as its calibration set: the zoo's RVC4 pose
 models were calibrated on 40 generic COCO images, which is part of why
-they underperform. This grabs evenly spaced frames from THE actual camera
-under THE actual venue lighting into a flat zip that HubAI accepts as
-`--quantization-data` (see docs/yolo11-conversion.md).
+they underperform. This captures evenly spaced frames from the actual
+camera under the actual venue lighting into a flat zip that HubAI accepts
+as `--quantization-data` (see docs/yolo11-conversion.md).
 
 Run stream_server first, have people move around in front of the camera,
 then:
@@ -24,17 +24,6 @@ import cv2
 import numpy as np
 
 import nsk
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--count", type=int, default=300,
-                   help="frames to capture")
-    p.add_argument("--interval", type=float, default=0.5,
-                   help="seconds between frames (spread over varied poses)")
-    p.add_argument("--out", default="calib_frames.zip")
-    p.add_argument("--segment", default="nice_stream_rgb")
-    return p.parse_args()
 
 
 def main() -> None:
@@ -58,8 +47,8 @@ def main() -> None:
     saved = 0
     with zipfile.ZipFile(args.out, "w", zipfile.ZIP_STORED) as zf:
         while saved < args.count:
-            frame, fid = nsk.newest_frame(cast(nsk.Buf, shm.buf), hdr,
-                                          np.uint8, 3, skip_id=last_id)
+            frame, fid = nsk.read_newest_frame(cast(nsk.Buf, shm.buf), hdr,
+                                               np.uint8, 3, skip_id=last_id)
             if frame is None:
                 time.sleep(0.05)
                 continue
@@ -78,6 +67,17 @@ def main() -> None:
     shm.close()
     print(f"done: {args.out} ({saved} frames). Feed it to hubai convert "
           "--quantization-data (docs/yolo11-conversion.md).")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--count", type=int, default=300,
+                        help="frames to capture")
+    parser.add_argument("--interval", type=float, default=0.5,
+                        help="seconds between frames (spread over varied poses)")
+    parser.add_argument("--out", default="calib_frames.zip")
+    parser.add_argument("--segment", default="nice_stream_rgb")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
