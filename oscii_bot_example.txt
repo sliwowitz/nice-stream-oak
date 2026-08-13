@@ -1,0 +1,94 @@
+// SPDX-FileCopyrightText: 2026 Jiří Vyskočil <jiri@vyskocil.com>
+// SPDX-License-Identifier: MIT
+//
+// Turns the nice-stream /nice/* OSC stream into MIDI, client-side, with
+// OSCII-bot (https://www.cockos.com/oscii-bot/). The wire format stays
+// untouched — this script is just another listener (see docs/osc.md).
+//
+// Setup:
+//   1. Put this file into OSCII-bot's script directory (on Windows:
+//      %APPDATA%\OSCII-bot; the app's window also offers to open it).
+//   2. Edit the @output line below to a substring of your MIDI device's
+//      name. No hardware? Create a virtual port with loopMIDI and use
+//      its name.
+//   3. Point a bridge at this machine:
+//        .venv/Scripts/python.exe osc_bridge.py --host <this-ip> --port 9001
+//      (A second bridge instance next to the Sonic Pi one is fine — the
+//      bridge only sends; nothing binds or conflicts.)
+//
+// MIDI mapping (CC values 0..127; channels shown 1-based as in most UIs):
+//   channel 1          group signals
+//     CC 20  count       (people x16 — 8 people reach 127)
+//     CC 21  centroid x  (-HALF_X..+HALF_X metres)
+//     CC 22  centroid y  (MIN_Y..MAX_Y metres)
+//     CC 23  centroid z  (0..MAX_Z metres)
+//     CC 24  spread      (0..1)
+//     CC 25  energy      (0..MAX_ENERGY m/s)
+//   channels 2..9      per-person slots 0..7
+//     CC 21/22/23  position x/y/z  (same ranges)
+//     CC 25  speed       (0..MAX_SPEED m/s)
+//     CC 26  confidence  (0..1)
+//     CC 27  present     (0 or 127)
+//     CC 28  person id   (id mod 128)
+//     note NOTE_PERSON: Note On on entered, Note Off on left
+//
+// A CC is sent only when its 7-bit value changes, so an empty room is
+// MIDI-silent and MIDI-learn tools see clean single moves.
+
+@input  osc_in   OSC  "*:9001"
+@output midi_out MIDI "loopMIDI"
+
+@init
+HALF_X      = 2.5;   // metres left/right of the camera axis at CC extremes
+MIN_Y       = -2.0;  // metres below the camera at CC 22 = 0
+MAX_Y       = 2.0;   // metres above the camera at CC 22 = 127
+MAX_Z       = 5.0;   // metres away from the camera at CC 23 = 127
+MAX_SPEED   = 3.0;   // m/s per person at CC 25 = 127
+MAX_ENERGY  = 6.0;   // m/s group sum at CC 25 = 127
+NOTE_PERSON = 60;    // C4, fired per slot on entered/left
+
+lastcc = 0;                  // memory base: last sent value per (channel, cc)
+memset(lastcc, -1, 16*128);  // -1 = nothing sent yet
+
+function clamp01(v) ( v < 0 ? 0 : v > 1 ? 1 : v );
+function cc7(v01) ( floor(clamp01(v01) * 127 + 0.5) );
+
+function send_cc(ch, cc, val) local(idx) (
+  idx = ch*128 + cc;
+  lastcc[idx] != val ? (
+    lastcc[idx] = val;
+    msg1 = 0xB0 + ch; msg2 = cc; msg3 = val;
+    midisend(midi_out);
+  );
+);
+
+function send_note(ch, on) (
+  msg1 = (on ? 0x90 : 0x80) + ch; msg2 = NOTE_PERSON; msg3 = on ? 127 : 0;
+  midisend(midi_out);
+);
+
+@oscmsg
+// Group signals -> channel 0 (shown as 1).
+oscmatch("/nice/group/count")    ? send_cc(0, 20, min(oscparm(0)*16, 127));
+oscmatch("/nice/group/centroid") ? (
+  send_cc(0, 21, cc7((oscparm(0) + HALF_X) / (2*HALF_X)));
+  send_cc(0, 22, cc7((oscparm(1) - MIN_Y) / (MAX_Y - MIN_Y)));
+  send_cc(0, 23, cc7(oscparm(2) / MAX_Z));
+);
+oscmatch("/nice/group/spread")   ? send_cc(0, 24, cc7(oscparm(0)));
+oscmatch("/nice/group/energy")   ? send_cc(0, 25, cc7(oscparm(0) / MAX_ENERGY));
+
+// Per-person slots -> channels 1..8 (shown as 2..9).
+oscmatch("/nice/slot/%d/position", slot) ? (
+  send_cc(1 + slot, 21, cc7((oscparm(0) + HALF_X) / (2*HALF_X)));
+  send_cc(1 + slot, 22, cc7((oscparm(1) - MIN_Y) / (MAX_Y - MIN_Y)));
+  send_cc(1 + slot, 23, cc7(oscparm(2) / MAX_Z));
+);
+oscmatch("/nice/slot/%d/speed",   slot) ? send_cc(1 + slot, 25, cc7(oscparm(0) / MAX_SPEED));
+oscmatch("/nice/slot/%d/conf",    slot) ? send_cc(1 + slot, 26, cc7(oscparm(0)));
+oscmatch("/nice/slot/%d/present", slot) ? send_cc(1 + slot, 27, oscparm(0) ? 127 : 0);
+oscmatch("/nice/slot/%d/id",      slot) ? send_cc(1 + slot, 28, oscparm(0) % 128);
+
+// Events -> notes on the slot's channel; args are (slot, id).
+oscmatch("/nice/event/entered") ? send_note(1 + oscparm(0), 1);
+oscmatch("/nice/event/left")    ? send_note(1 + oscparm(0), 0);
