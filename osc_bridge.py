@@ -57,6 +57,11 @@ def main() -> None:
     # SO_BROADCAST costs nothing for unicast and lets --host point at a
     # subnet broadcast address so every listener on the LAN hears the stream.
     client = udp_client.SimpleUDPClient(args.host, args.port, allow_broadcast=True)
+    # pythonosc leaves the socket non-blocking; on Windows a busy send
+    # buffer (e.g. pending ARP for a fresh remote host) then raises
+    # WinError 10035 and kills the bridge. A blocking UDP send just waits
+    # the microseconds the buffer needs.
+    client._sock.setblocking(True)  # private, but pythonosc has no public knob
     shm, max_persons, num_kp, stride, K = attach_pose_segment(args.segment)
     tracker = Tracker(args)
 
