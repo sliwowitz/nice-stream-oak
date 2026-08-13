@@ -39,6 +39,7 @@ plugins:
 
 nav:
   - Home: index.md
+  - YOLO11 Conversion: yolo11-conversion.md
   - API Reference: reference/
 
 markdown_extensions:

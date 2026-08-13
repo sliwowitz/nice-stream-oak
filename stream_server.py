@@ -33,6 +33,7 @@ import sys
 import time
 from collections.abc import Callable
 from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 from types import FrameType
 from typing import Any
 
@@ -96,8 +97,10 @@ INTERACTIVE = ("--interactive" in sys.argv
 NBUF   = 3                          # frame ring depth (depth & rgb segments)
 
 # Any HubAI slug depthai-nodes can parse (the YOLO-pose family is the safe
-# bet). Input size is read from the model archive; frames are letterboxed
-# into it and keypoints mapped back to full-frame pixels.
+# bet), OR a path to a local NNArchive (.tar.xz) -- e.g. a YOLO11-pose
+# converted through HubAI. Input size is read from the model archive;
+# frames are letterboxed into it and keypoints mapped back to full-frame
+# pixels.
 POSE_MODEL = os.environ.get(
     "NICE_STREAM_POSE_MODEL",
     "luxonis/yolov8-large-pose-estimation:coco-640x352")
@@ -159,7 +162,7 @@ def _choose_model() -> None:
     if choice in ("", "keep"):
         return
     if choice == "c":
-        POSE_MODEL = _ask("HubAI slug", POSE_MODEL)
+        POSE_MODEL = _ask("HubAI slug or NNArchive path", POSE_MODEL)
     elif choice.isdigit() and 1 <= int(choice) <= len(KNOWN_POSE_MODELS):
         POSE_MODEL = KNOWN_POSE_MODELS[int(choice) - 1][0]
     else:
@@ -429,9 +432,12 @@ def stream_once(ids: dict[str, int]) -> dict[str, int]:
             # ankles -- and skewed every keypoint scaled by full-frame height.
             # An explicit LETTERBOX output keeps the whole FOV; make_kp_mapper
             # undoes the pads.
-            desc = dai.NNModelDescription(POSE_MODEL)
-            desc.platform = pipeline.getDefaultDevice().getPlatformAsString()
-            nn_archive = dai.NNArchive(dai.getModelFromZoo(desc))
+            if os.path.exists(POSE_MODEL):       # local NNArchive file
+                nn_archive = dai.NNArchive(Path(POSE_MODEL))
+            else:                                # HubAI model slug
+                desc = dai.NNModelDescription(POSE_MODEL)
+                desc.platform = pipeline.getDefaultDevice().getPlatformAsString()
+                nn_archive = dai.NNArchive(dai.getModelFromZoo(desc))
             nn_w, nn_h = nn_archive.getInputWidth(), nn_archive.getInputHeight()
             if not nn_w or not nn_h:
                 raise RuntimeError(f"model '{POSE_MODEL}' lacks a static input size")
