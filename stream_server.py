@@ -46,6 +46,9 @@ import nsk
 from nsk import (
     HEADER_SIZE,
     KP_CONF_MIN,
+    LINK_ETHERNET,
+    LINK_NAMES,
+    LINK_UNKNOWN,
     MAX_PERSONS,
     NUM_KP,
     STATUS_RECONNECTING,
@@ -123,6 +126,16 @@ RETRY_DELAY     = 3.0
 RETRY_DELAY_MAX = 30.0
 STALE_AFTER     = 5.0               # no depth frame for this long -> dead
 
+# depthai's UsbSpeed -> our wire codes, by name: the enum's numbering belongs
+# to Luxonis, the wire's belongs to nsk.py.
+USB_SPEED_LINKS = {
+    "LOW":        nsk.LINK_LOW,
+    "FULL":       nsk.LINK_FULL,
+    "HIGH":       nsk.LINK_HIGH,
+    "SUPER":      nsk.LINK_SUPER,
+    "SUPER_PLUS": nsk.LINK_SUPER_PLUS,
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s %(message)s",
@@ -139,7 +152,7 @@ def main() -> None:
     Frame ids persist across sessions, so consumers see one monotonic
     stream. The retry delay backs off toward RETRY_DELAY_MAX.
     """
-    global _reconnects
+    global _link, _reconnects
 
     if INTERACTIVE:
         configure_interactively()
@@ -172,6 +185,7 @@ def main() -> None:
             break
 
         _reconnects += 1
+        _link = LINK_UNKNOWN        # no device, no link -- clear Unity's banner
         set_status(STATUS_RECONNECTING)
         log.info("reconnect #%d in %.0fs", _reconnects, delay)
         deadline = time.time() + delay
@@ -198,6 +212,12 @@ def stream_once(ids: dict[str, int]) -> dict[str, int]:
     log.info("opening %s (%s)", info.name, info.protocol)
 
     with dai.Pipeline(dai.Device(info)) as pipeline:
+        # Before the pipeline build, which costs seconds and buries anything
+        # logged under it: a bad link is worth knowing about immediately, in
+        # the terminal and in Unity.
+        check_link(pipeline.getDefaultDevice(), info)
+        set_status(STATUS_STARTING)
+
         cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
         # Undistorted: the wide-lens RGB is heavily distorted, and ImageAlign
         # outputs undistorted depth -- both sides must agree or colours slide
@@ -311,9 +331,10 @@ def stream_once(ids: dict[str, int]) -> dict[str, int]:
 
                 fps_n += 1
                 if fps_n >= 120:
-                    log.info("%.1f fps  (depth %d, rgb %d, pose %d)",
+                    log.info("%.1f fps  (depth %d, rgb %d, pose %d)%s",
                              fps_n / (time.time() - fps_t0),
-                             ids["depth"], ids["rgb"], ids["pose"])
+                             ids["depth"], ids["rgb"], ids["pose"],
+                             link_suffix())
                     fps_n, fps_t0 = 0, time.time()
 
             pkt = q_rgb.tryGet()
@@ -375,6 +396,46 @@ def pick_device() -> dai.DeviceInfo | None:
             if d.protocol == dai.XLinkProtocol.X_LINK_USB_EP:
                 return d
     return devices[0]
+
+
+_link = LINK_UNKNOWN                # negotiated link of the open device
+
+
+def check_link(device: dai.Device, info: dai.DeviceInfo) -> None:
+    """Publishes the negotiated link speed and shouts when it is degraded.
+
+    A USB-C plug seated the wrong way round renegotiates as USB2: nothing
+    looks wrong, everything runs at roughly a quarter speed, and the only
+    hint is one firmware line that the first fps report buries seconds
+    later. Hence the three-line banner here, the reminder on every fps line
+    (see link_suffix), and the byte Unity reads out of the status word.
+    """
+    global _link
+
+    if info.protocol != dai.XLinkProtocol.X_LINK_USB_EP:
+        _link = LINK_ETHERNET       # not a USB link; speed is not ours to judge
+        log.info("link: %s (%s)", LINK_NAMES[_link], info.protocol)
+        return
+
+    _link = USB_SPEED_LINKS.get(device.getUsbSpeed().name, LINK_UNKNOWN)
+    if not nsk.link_is_degraded(_link):
+        log.info("USB link: %s", LINK_NAMES[_link])
+        return
+
+    log.warning("!!!!!!!!!!!!!!!!!!!!!  DEGRADED USB LINK  !!!!!!!!!!!!!!!!!!!!!")
+    log.warning("!!  negotiated %s, expected USB3 (SUPER) -- everything "
+                "below runs at ~1/4 speed", LINK_NAMES[_link])
+    log.warning("!!  FIX: unplug the USB-C connector and replug it FLIPPED "
+                "180 degrees (either end)")
+
+
+def link_suffix() -> str:
+    """Tail for the fps line while the link is degraded. The startup banner
+    scrolls away within a minute; the fps lines are what a puzzled human
+    actually reads."""
+    if not nsk.link_is_degraded(_link):
+        return ""
+    return f"   <<<< {LINK_NAMES[_link]} LINK -- REPLUG THE USB-C FLIPPED"
 
 
 def configure_depth_filters(stereo: dai.node.StereoDepth) -> None:
@@ -587,9 +648,10 @@ def write_headers(fx: float = 0.0, fy: float = 0.0,
 
 
 def set_status(status: int) -> None:
-    struct.pack_into("<2I", buf_depth, 56, status, _reconnects)
-    struct.pack_into("<2I", buf_rgb,   56, status, _reconnects)
-    struct.pack_into("<I",  buf_pose,  44, status)
+    word = nsk.pack_status(status, _link)
+    struct.pack_into("<2I", buf_depth, 56, word, _reconnects)
+    struct.pack_into("<2I", buf_rgb,   56, word, _reconnects)
+    struct.pack_into("<I",  buf_pose,  44, word)
 
 
 # ------------------------------------------------------ interactive setup ---

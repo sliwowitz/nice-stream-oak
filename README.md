@@ -94,6 +94,18 @@ licensed to run only on Luxonis hardware.
 
 ## Hardware notes
 
+**The USB-C link is orientation-sensitive.** The same cable in the same
+ports can negotiate USB3 one day and USB2 the next, purely on which way
+round the connector went in. Nothing looks broken — the camera opens,
+streams, and runs at roughly a quarter of the frame rate (~8 fps instead
+of ~30). The fix is to unplug the connector and replug it flipped 180°;
+either end will do.
+
+Because that costs an afternoon if you miss it, `stream_server.py` shouts
+three warning lines on a degraded start, repeats the reminder on every fps
+line, and publishes the negotiated speed in the status word (`nsk.LINK_*`)
+so Unity can put a red banner over the Game view.
+
 To test the OAK-4 outside this project, use OAK Viewer. If the camera does
 not show up even though it is connected and its LED is static blue, reset
 it: hold the button on the back with a SIM tool for 5 s. OAK Viewer picks

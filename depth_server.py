@@ -23,6 +23,8 @@ Header (little endian, 64 bytes):
   32  float64 timestamp (unix seconds)
   40  float32 fx, fy, cx, cy
   56  uint32  status          <- 0 starting, 1 streaming, 2 reconnecting
+                                 (nsk.py packs a LINK_* speed into byte 1;
+                                  this server leaves it 0 = unknown)
   60  uint32  reconnect_count
 """
 

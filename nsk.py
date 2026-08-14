@@ -16,7 +16,7 @@ Frame segments ('NSK1' -- depth & rgb), ring of `buffer_count` buffers::
     24  uint64  frame_id        <- written last, acts as the commit
     32  float64 timestamp (unix seconds)
     40  float32 fx, fy, cx, cy
-    56  uint32  status          <- STATUS_*
+    56  uint32  status word     <- STATUS_* in byte 0, LINK_* in byte 1
     60  uint32  reconnect_count
 
 Pose segment ('NSKP'), single buffered::
@@ -30,7 +30,7 @@ Pose segment ('NSKP'), single buffered::
     24  uint64  frame_id        <- written last, acts as the commit
     32  float64 timestamp
     40  uint32  num_persons     (valid persons this frame)
-    44  uint32  status
+    44  uint32  status word     <- same packing as above
     48  float32 fx, fy, cx, cy
 
 Pose body: max_persons fixed slots, each person_stride bytes::
@@ -74,6 +74,30 @@ POSE_SZ       = HEADER_SIZE + MAX_PERSONS * PERSON_STRIDE
 STATUS_STARTING     = 0
 STATUS_STREAMING    = 1
 STATUS_RECONNECTING = 2
+
+# Negotiated camera link, packed into the status word's second byte. A USB-C
+# plug seated the wrong way round renegotiates as USB2 with no outward sign
+# and about a quarter of the frame rate, so the wire carries the speed and
+# every consumer gets to shout about it. Numbering happens to match depthai's
+# UsbSpeed, but stream_server.py maps by name -- that enum is Luxonis's to
+# renumber, this one is ours.
+LINK_UNKNOWN    = 0
+LINK_LOW        = 1                 # USB1
+LINK_FULL       = 2                 # USB1.1
+LINK_HIGH       = 3                 # USB2   <- the degradation that bites
+LINK_SUPER      = 4                 # USB3   <- what the OAK-4 should do
+LINK_SUPER_PLUS = 5                 # USB3.1+
+LINK_ETHERNET   = 6                 # not USB; its speed is not ours to judge
+
+LINK_NAMES = {
+    LINK_UNKNOWN:    "unknown",
+    LINK_LOW:        "USB1 (LOW)",
+    LINK_FULL:       "USB1.1 (FULL)",
+    LINK_HIGH:       "USB2 (HIGH)",
+    LINK_SUPER:      "USB3 (SUPER)",
+    LINK_SUPER_PLUS: "USB3.1+ (SUPER_PLUS)",
+    LINK_ETHERNET:   "ethernet",
+}
 
 # Depth-lift rules shared by every pose producer.
 DEPTH_PATCH   = 2                   # median over (2k+1)^2 px per keypoint
@@ -163,6 +187,29 @@ def parse_pose_header(buf: Buf) -> PoseHeader | None:
             "intrinsics": struct.unpack_from("<4f", buf, 48)}
 
 
+# ---------------------------------------------------------- status word -----
+def pack_status(status: int, link: int = LINK_UNKNOWN) -> int:
+    """Fold STATUS_* and LINK_* into the one uint32 consumers read.
+
+    Two bytes of one word rather than two fields: the headers were full, and
+    growing them would resize the segments -- fatal while a consumer still
+    holds the old mapping open. A producer that knows nothing of links keeps
+    writing the bare enum and reads back as LINK_UNKNOWN.
+    """
+    return (status & 0xFF) | ((link & 0xFF) << 8)
+
+
+def unpack_status(word: int) -> tuple[int, int]:
+    """Split a status word into (STATUS_*, LINK_*)."""
+    return word & 0xFF, (word >> 8) & 0xFF
+
+
+def link_is_degraded(link: int) -> bool:
+    """True for a known link slower than USB3: it streams, badly."""
+    return LINK_LOW <= link < LINK_SUPER
+
+
+# ------------------------------------------------------------ frame commit --
 def commit_frame(buf: Buf, frame_id: int, timestamp: float | None = None) -> None:
     """Publish a frame: id + timestamp in one write, always last."""
     struct.pack_into("<Qd", buf, 24, frame_id,

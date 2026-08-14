@@ -71,6 +71,26 @@ def test_frame_header_roundtrip():
     assert nsk.parse_frame_header(bytearray(nsk.HEADER_SIZE)) is None    # unwritten
 
 
+def test_status_word_carries_link_speed():
+    """One uint32, two bytes: ShmSegment.cs splits it exactly this way."""
+    word = nsk.pack_status(nsk.STATUS_STREAMING, nsk.LINK_HIGH)
+    assert nsk.unpack_status(word) == (nsk.STATUS_STREAMING, nsk.LINK_HIGH)
+    assert word & 0xFF == nsk.STATUS_STREAMING      # status still readable raw
+    # A producer that knows nothing of links (depth_server.py) writes the
+    # bare enum, and reads back as a link we make no claims about.
+    assert nsk.unpack_status(nsk.STATUS_RECONNECTING) == \
+        (nsk.STATUS_RECONNECTING, nsk.LINK_UNKNOWN)
+
+
+def test_link_degraded_only_below_usb3():
+    assert nsk.link_is_degraded(nsk.LINK_HIGH)      # USB2: the one that bites
+    assert nsk.link_is_degraded(nsk.LINK_FULL)
+    assert not nsk.link_is_degraded(nsk.LINK_SUPER)
+    assert not nsk.link_is_degraded(nsk.LINK_SUPER_PLUS)
+    assert not nsk.link_is_degraded(nsk.LINK_UNKNOWN)   # no news is not bad news
+    assert not nsk.link_is_degraded(nsk.LINK_ETHERNET)  # not a USB link at all
+
+
 def test_depth_at_rules():
     depth = np.zeros((100, 100), dtype=np.uint16)
     depth[40:60, 40:60] = 2000                 # 2 m block
