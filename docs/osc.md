@@ -24,6 +24,7 @@ camera frame: y up, z away from the camera.
 | `/nice/slot/<i>/position` | x y z | person centroid, metres |
 | `/nice/slot/<i>/speed` | m/s | smoothed centroid speed |
 | `/nice/slot/<i>/conf` | 0..1 | detection confidence |
+| `/nice/pair/<i>-<j>/distance` | m | how far apart slots `<i>` and `<j>` are |
 | `/nice/event/entered` | int slot, int id | fires once on appearance |
 | `/nice/event/left` | int slot, int id | fires once after departure |
 
@@ -34,10 +35,49 @@ Brief dropouts (occlusion, people crossing) are bridged by a grace
 window (default 2 s, `--grace`) — no `left`/`entered` pair fires for
 them.
 
+**Pair semantics:** one address per slot pair, `<i>` < `<j>` in a single
+`<i>-<j>` element (`/nice/pair/2-5/distance`), so a pair address is as
+sticky as the two slots it joins — up to 28 pairs for 8 slots. Distance
+is measured on the floor plane (x, z), ignoring height, the same measure
+`spread` and the tracker use. A pair is sent only while both its slots
+are present; the rest are simply absent from the bundle rather than sent
+as zeroes, so read `/nice/slot/<i>/present` from the same bundle to tell
+"far apart" from "not there". Pairs touching one slot take two patterns,
+`/nice/pair/2-*/distance` and `/nice/pair/*-2/distance`.
+
 **Sonic Pi:** run the bridge with `--port 4560`; cues arrive as
 `/osc*/nice/...` (see `sonicpi_example.rb`). When the bridge runs on
 another machine, enable *Receive remote OSC messages* in Preferences →
 IO.
+
+Sonic Pi's interface degrades to unusable a few minutes into a full
+stream. It renders every arriving message into its cue log, and its
+maintainers describe those logs as costing "a huge amount of CPU" at
+high message rates. Count messages, not frames: a bundle is 21 addresses
+with two people and 72 with eight, so even `--rate 10` delivers hundreds
+a second. Lowering the rate alone will not save it.
+
+Give Sonic Pi its own narrowed instance instead:
+
+```
+osc_bridge.py --port 4560 --rate 10 \
+    --only "/nice/group/energy,/nice/slot/0/position,/nice/event/*"
+```
+
+`--only` takes comma-separated globs matched against the whole address
+(`*` spans `/`). The instance above sends 2 messages a frame — 20 a
+second — regardless of how many people are in the room. Other receivers
+keep their own unfiltered instance; the bridge only sends, so run as many
+as you need. Then also:
+
+- `use_cue_logging false`, and clear *Log cues* and *Log synths* in
+  Preferences (under the editor/logging settings; the exact wording moves
+  between versions). Note that hiding the log panels is itself broken in
+  4.5.1 — narrowing the stream is the fix that does not depend on the GUI.
+- `sleep` after each `sync` in loops following a continuous signal, so the
+  music's rate is yours rather than the camera's. `sync` waits for the
+  *next* cue, so frames arriving during the sleep are skipped, not queued.
+  Rare events (`entered`, `left`) can stay unthrottled.
 
 **MIDI:** the stream converts to MIDI client-side, without touching the
 wire format — `oscii_bot_example.txt` is a ready recipe for

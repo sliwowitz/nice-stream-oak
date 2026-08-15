@@ -23,8 +23,13 @@ OSC namespace (floats unless noted):
   /nice/slot/<i>/position  x y z metres
   /nice/slot/<i>/speed     m/s   smoothed centroid speed
   /nice/slot/<i>/conf      0..1  detection confidence
+  /nice/pair/<i>-<j>/distance    m, floor plane; only while both present
   /nice/event/entered      slot id     (fires once)
   /nice/event/left         slot id     (fires once)
+
+A full frame is ~50 addresses whatever --rate says, which some receivers
+cannot render that fast (Sonic Pi logs every arriving message). --only
+narrows an instance to the addresses one receiver actually consumes.
 
 Sonic Pi: run with --port 4560; cues arrive as /osc*/nice/... (see
 sonicpi_example.rb). Debug without Sonic Pi: osc_monitor.py.
@@ -36,9 +41,12 @@ the LAN at once; receivers need no configuration beyond an open port.
 """
 
 import argparse
+import fnmatch
 import functools
+import itertools
 import math
 import time
+from collections.abc import Callable, Sequence
 from multiprocessing import shared_memory
 from typing import cast
 
@@ -64,11 +72,13 @@ def main() -> None:
     client._sock.setblocking(True)  # private, but pythonosc has no public knob
     shm, max_persons, num_kp, stride, K = attach_pose_segment(args.segment)
     tracker = Tracker(args)
+    keep = address_filter(args.only)
 
     last_fid = 0
     last_emit = 0.0
 
-    print(f"emitting to {args.host}:{args.port} at <= {args.rate:.0f} Hz")
+    print(f"emitting to {args.host}:{args.port} at <= {args.rate:.0f} Hz"
+          + (f", only {args.only}" if args.only else ""))
     while True:
         fid, persons = nsk.read_pose_frame(cast(nsk.Buf, shm.buf),
                                            max_persons, num_kp, stride)
@@ -100,7 +110,7 @@ def main() -> None:
 
         bundle = osc_bundle_builder.OscBundleBuilder(
             osc_bundle_builder.IMMEDIATELY)
-        add = functools.partial(_add_message, bundle)
+        add = functools.partial(_add_message, bundle, keep)
 
         add("/nice/group/count", count)
         add("/nice/group/centroid", gx, gy, gz)
@@ -118,6 +128,14 @@ def main() -> None:
                 add(f"/nice/slot/{s}/conf", t.conf)
             else:
                 add(f"/nice/slot/{s}/present", 0)
+
+        # One address per slot pair, sticky for as long as both people stay.
+        # Absent pairs are silent rather than zeroed: the slot present flags
+        # in this same bundle already say which pairs exist, and carrying all
+        # 28 standing zeroes would cost a kilobyte per frame for nothing.
+        for i, j in itertools.combinations(sorted(by_slot), 2):
+            add(f"/nice/pair/{i}-{j}/distance",
+                floor_distance(by_slot[i].pos, by_slot[j].pos))
 
         for kind, slot, tid in tracker.events:
             add(f"/nice/event/{kind}", slot, tid)
@@ -151,6 +169,9 @@ def parse_args() -> argparse.Namespace:
                         help="m/s; gate growth for tracks unseen for a while")
     parser.add_argument("--grace", type=float, default=2.0,
                         help="seconds a lost track survives before 'left'")
+    parser.add_argument("--only", default=None, metavar="GLOB[,GLOB...]",
+                        help="send only addresses matching these globs, e.g. "
+                             "'/nice/group/*,/nice/event/*'; default sends all")
     parser.add_argument("--segment", default="nice_stream_pose")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -202,6 +223,34 @@ def centroid_of(joints: list[nsk.Joint], K: nsk.Intrinsics) -> Vec3 | None:
     if sw == 0.0:
         return None
     return (sx / sw, sy / sw, sz / sw)
+
+
+def address_filter(patterns: str | None) -> Callable[[str], bool]:
+    """Build the predicate deciding which addresses reach the wire.
+
+    `patterns` is a comma-separated list of globs matched against the whole
+    address -- '*' spans '/', so both '/nice/group/*' and '/nice/*energy'
+    work -- and None keeps everything.
+
+    This is a receiver's escape hatch, not a bandwidth measure: a frame is
+    ~50 addresses however low --rate goes, and a receiver that does work
+    per message (Sonic Pi renders each one into its cue log) drowns in the
+    count long before the byte count matters. Give such a receiver its own
+    instance narrowed to the handful of addresses it consumes.
+    """
+    if not patterns:
+        return lambda _address: True
+    globs = [p.strip() for p in patterns.split(",") if p.strip()]
+    return lambda address: any(fnmatch.fnmatchcase(address, g) for g in globs)
+
+
+def floor_distance(a: Sequence[float], b: Sequence[float]) -> float:
+    """Distance between two positions on the floor plane (x, z), in metres.
+
+    Height is deliberately ignored: people's heights do not change, and
+    vertical centroid noise (occluded legs) should not move a distance.
+    """
+    return math.hypot(a[0] - b[0], a[2] - b[2])
 
 
 class Track:
@@ -256,7 +305,7 @@ class Tracker:
         for t in self.tracks:
             gate = self.args.gate + self.args.gate_speed * (now - t.last_seen)
             for di, (_conf, centroid) in enumerate(detections):
-                d = math.hypot(centroid[0] - t.pos[0], centroid[2] - t.pos[2])
+                d = floor_distance(centroid, t.pos)
                 if d <= gate:
                     pairs.append((d, t, di))
         pairs.sort(key=lambda pair: pair[0])
@@ -302,8 +351,11 @@ class Tracker:
         return None
 
 
-def _add_message(bundle: osc_bundle_builder.OscBundleBuilder, address: str,
+def _add_message(bundle: osc_bundle_builder.OscBundleBuilder,
+                 keep: Callable[[str], bool], address: str,
                  *values: float) -> None:
+    if not keep(address):
+        return
     msg = osc_message_builder.OscMessageBuilder(address=address)
     for v in values:
         msg.add_arg(v)
