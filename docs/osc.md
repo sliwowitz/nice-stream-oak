@@ -79,6 +79,42 @@ as you need. Then also:
   *next* cue, so frames arriving during the sleep are skipped, not queued.
   Rare events (`entered`, `left`) can stay unthrottled.
 
+## Recording a session, composing away from it
+
+The camera, the servers and the room are needed to *make* the stream, not
+to work with it. Record while people are actually in the space, then hand
+over two files — the recording and `osc_tape.py` — and whoever writes the
+music has the installation on their own machine.
+
+Record straight from the bridge, which cannot miss a bundle:
+
+```
+osc_bridge.py --host <receiver> --port 4560 --rate 10 --record gallery.osctape
+```
+
+It records exactly what it sends, `--only` filtering included, and flushes
+every packet, so an interrupted terminal costs nothing. `osc_tape.py
+record gallery.osctape --port 9001` does the same from the listening end
+when the sender is out of reach.
+
+Replay needs nothing but a Python install — no venv, no python-osc, no
+camera:
+
+```
+python osc_tape.py play gallery.osctape --port 4560          # Sonic Pi
+python osc_tape.py play gallery.osctape --loop --speed 0.5   # rehearse
+```
+
+Recordings are made and replayed whole; `--only` narrows a replay the same
+way it narrows the live bridge, for a receiver that wants less. Hand the
+recipient [Playing a recording](playback.md) and they need nothing else.
+
+Whole UDP payloads are stored byte for byte, so a replay is
+indistinguishable from the live bridge: same addresses, same bundles, same
+timing. Sender-dependent cue names differ (`/osc:127.0.0.1:...` rather than
+the camera machine's address), which is precisely why the examples match
+on `/osc*/nice/...`.
+
 **MIDI:** the stream converts to MIDI client-side, without touching the
 wire format — `oscii_bot_example.txt` is a ready recipe for
 [OSCII-bot](https://www.cockos.com/oscii-bot/) (group signals as CCs on

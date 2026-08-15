@@ -41,18 +41,18 @@ the LAN at once; receivers need no configuration beyond an open port.
 """
 
 import argparse
-import fnmatch
 import functools
 import itertools
 import math
 import time
 from collections.abc import Callable, Sequence
 from multiprocessing import shared_memory
-from typing import cast
+from typing import BinaryIO, cast
 
 from pythonosc import osc_bundle_builder, osc_message_builder, udp_client
 
 import nsk
+import osc_tape
 from nsk import KP_CONF_MIN as MIN_JOINT_CONF
 from nsk import MAX_PERSONS as MAX_SLOTS
 
@@ -72,10 +72,16 @@ def main() -> None:
     client._sock.setblocking(True)  # private, but pythonosc has no public knob
     shm, max_persons, num_kp, stride, K = attach_pose_segment(args.segment)
     tracker = Tracker(args)
-    keep = address_filter(args.only)
+    # Shared with osc_tape so a live stream and a replay narrow alike. This
+    # is a receiver's escape hatch, not a bandwidth measure: a frame is ~50
+    # addresses however low --rate goes, and a receiver that does work per
+    # message (Sonic Pi renders each into its cue log) drowns in the count
+    # long before the byte count matters.
+    keep = osc_tape.address_filter(args.only)
 
     last_fid = 0
     last_emit = 0.0
+    tape, tape_start = open_tape(args.record), 0.0
 
     print(f"emitting to {args.host}:{args.port} at <= {args.rate:.0f} Hz"
           + (f", only {args.only}" if args.only else ""))
@@ -141,7 +147,11 @@ def main() -> None:
         for kind, slot, tid in tracker.events:
             add(f"/nice/event/{kind}", slot, tid)
 
-        client.send(bundle.build())
+        packet = bundle.build()
+        client.send(packet)
+        if tape is not None:
+            tape_start = tape_start or now      # first bundle starts the clock
+            osc_tape.write_packet(tape, now - tape_start, packet.dgram)
 
         if args.verbose:
             slots = " ".join(f"{t.slot}:id{t.id}" for t in tracks)
@@ -170,6 +180,9 @@ def parse_args() -> argparse.Namespace:
                         help="m/s; gate growth for tracks unseen for a while")
     parser.add_argument("--grace", type=float, default=2.0,
                         help="seconds a lost track survives before 'left'")
+    parser.add_argument("--record", default=None, metavar="FILE",
+                        help="also write every sent bundle to FILE; replay it "
+                             "later with osc_tape.py, no camera needed")
     parser.add_argument("--only", default=None, metavar="GLOB[,GLOB...]",
                         help="send only addresses matching these globs, e.g. "
                              "'/nice/group/*,/nice/event/*'; default sends all")
@@ -235,6 +248,21 @@ def centroid_of(joints: list[nsk.Joint], K: nsk.Intrinsics) -> Vec3 | None:
     return (sx / sw, sy / sw, sz / sw)
 
 
+def open_tape(path: str | None) -> BinaryIO | None:
+    """Start a recording of what this bridge sends, or None for --record off.
+
+    Recorded here rather than by a listener because this is the one place
+    that cannot miss a bundle: no second process to forget to start, and
+    nothing lost to the network in between.
+    """
+    if path is None:
+        return None
+    tape = open(path, "wb")
+    tape.write(osc_tape.MAGIC)
+    print(f"recording to {path} (replay with osc_tape.py play)")
+    return tape
+
+
 def usable(K: nsk.Intrinsics) -> bool:
     """Whether these intrinsics can unproject: a zero focal length cannot."""
     return K[0] > 0.0 and K[1] > 0.0
@@ -255,25 +283,6 @@ def current_intrinsics(buf: nsk.Buf, last: nsk.Intrinsics) -> nsk.Intrinsics:
         return last
     K = hdr["intrinsics"]
     return K if usable(K) else last
-
-
-def address_filter(patterns: str | None) -> Callable[[str], bool]:
-    """Build the predicate deciding which addresses reach the wire.
-
-    `patterns` is a comma-separated list of globs matched against the whole
-    address -- '*' spans '/', so both '/nice/group/*' and '/nice/*energy'
-    work -- and None keeps everything.
-
-    This is a receiver's escape hatch, not a bandwidth measure: a frame is
-    ~50 addresses however low --rate goes, and a receiver that does work
-    per message (Sonic Pi renders each one into its cue log) drowns in the
-    count long before the byte count matters. Give such a receiver its own
-    instance narrowed to the handful of addresses it consumes.
-    """
-    if not patterns:
-        return lambda _address: True
-    globs = [p.strip() for p in patterns.split(",") if p.strip()]
-    return lambda address: any(fnmatch.fnmatchcase(address, g) for g in globs)
 
 
 def floor_distance(a: Sequence[float], b: Sequence[float]) -> float:

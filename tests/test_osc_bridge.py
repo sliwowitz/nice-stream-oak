@@ -48,22 +48,3 @@ def test_a_new_camera_replaces_the_held_intrinsics():
 def test_an_unwritten_header_holds_rather_than_reads_garbage():
     assert osc_bridge.current_intrinsics(bytearray(4096), REAL) == REAL
 
-
-# -------------------------------------------------------- address filter ----
-def test_no_filter_keeps_every_address():
-    keep = osc_bridge.address_filter(None)
-    assert keep("/nice/group/energy") and keep("/nice/slot/7/conf")
-
-
-def test_globs_span_slashes_and_select_whole_families():
-    keep = osc_bridge.address_filter("/nice/group/*,/nice/pair/*")
-    assert keep("/nice/group/energy")
-    assert keep("/nice/pair/0-1/distance")
-    assert not keep("/nice/slot/0/position")
-    assert not keep("/nice/event/entered")
-
-
-def test_a_single_address_narrows_to_exactly_it():
-    keep = osc_bridge.address_filter(" /nice/slot/0/position ")
-    assert keep("/nice/slot/0/position")
-    assert not keep("/nice/slot/1/position")

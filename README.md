@@ -30,6 +30,10 @@ publishes depth, RGB and pose frames into shared memory for the Unity side.
   (Sonic Pi etc.; see `sonicpi_example.rb`).
 - `osc_monitor.py` — terminal OSC monitor; debugs the bridge without
   Sonic Pi.
+- `osc_tape.py` — records the OSC stream to a file and replays it later
+  (`osc_bridge.py --record` writes the same format). Standard library
+  only: hand it and a recording to whoever writes the music and they need
+  no camera, no servers and no venv (see `docs/osc.md`).
 - `oscii_bot_example.txt` — OSC-to-MIDI recipe for OSCII-bot; turns the
   bridge's stream into CCs and notes for MIDI-only gear (see `docs/osc.md`).
 - `calib_capture.py` — grabs rgb frames from the running stream into a zip
