@@ -106,6 +106,13 @@ def _stop(signum: int, _frame: FrameType | None) -> None:
 
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
+# Windows only, and the one that matters when stream_server owns this
+# process: CTRL_BREAK is the only console event that can be aimed at a
+# single process group, so it is what a parent sends to stop just its child.
+# It arrives as SIGBREAK, not SIGINT, and the default action for SIGBREAK is
+# to die on the spot -- which would skip the cleanup below.
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _stop)
 
 
 # ------------------------------------------------------------------ main ----
@@ -249,7 +256,15 @@ def load_rtmo() -> Any:
     from rtmlib import RTMO
     src = RTMO_URLS.get(RTMO_MODEL, RTMO_MODEL)
     log.info("loading RTMO (%s) on %s ...", RTMO_MODEL, ORT_DEVICE)
-    model = RTMO(src, model_input_size=(640, 640), score_thr=SCORE_THR,
+    # RTMO_INPUT, not a literal 640. rtmlib pads TOP-LEFT while
+    # nsk.letterbox_transform pads CENTRED, and the two only agree today
+    # because to_model_input hands rtmlib an array that is already exactly
+    # model_input_size, which short-circuits rtmlib's own letterbox. Let this
+    # size drift from RTMO_INPUT and rtmlib starts re-padding top-left while
+    # to_source keeps undoing a centred pad -- every keypoint shifts by pad_y,
+    # silently, with nothing raising anywhere.
+    model = RTMO(src, model_input_size=(RTMO_INPUT, RTMO_INPUT),
+                 score_thr=SCORE_THR,
                  backend="onnxruntime", device=ORT_DEVICE)
 
     # Silent CPU fallback is a known Windows failure mode -- make it loud.

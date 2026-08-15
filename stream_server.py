@@ -8,9 +8,16 @@ Supersedes depth_server.py. One depthai pipeline feeds three segments:
   nice_stream_rgb     RGB888 interleaved, same resolution & intrinsics as depth
   nice_stream_pose    3D skeletons: 2D keypoints from a configurable HubAI
                       pose model (default YOLOv8-large) lifted to metres by
-                      sampling the aligned depth map. Optionally disabled
-                      (POSE_SOURCE=none) in favour of the host backend,
-                      pose_server.py.
+                      sampling the aligned depth map -- or from the host
+                      backend (POSE_SOURCE=host), which this process starts
+                      and stops for you.
+
+This is the single entry point. Whichever backend produces the skeletons,
+depth and rgb are published at full resolution from the same pipeline: the
+pose source decides who writes nice_stream_pose, never what the point cloud
+gets. Selecting the host backend here also rules out the failure that
+choosing it by hand invites -- two processes writing one pose segment
+because someone forgot to demote the on-device NN.
 
 The wire layout of all three segments lives in nsk.py -- the single source
 of truth shared with pose_server.py and osc_bridge.py, and mirrored by the
@@ -29,6 +36,7 @@ import logging
 import os
 import signal
 import struct
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -80,12 +88,30 @@ FPS    = float(os.environ.get("NICE_STREAM_FPS", "60"))
 IR_DOT   = float(os.environ.get("NICE_STREAM_IR_DOT", "0.8"))
 IR_FLOOD = float(os.environ.get("NICE_STREAM_IR_FLOOD", "0.5"))
 
-# Where the pose NN looks. "left" = the IR-flood-lit mono camera, usable in a
-# dark room; keypoints are remapped into the CAM_A frame server-side so
-# consumers never notice. "rgb" = the colour camera (needs visible light).
-# "none" = no on-device pose; a host backend (pose_server.py) writes the
-# pose segment instead, and the RVC4 spends everything on depth.
+# Which backend produces the skeletons. The first two run on the camera; the
+# last two leave the pose segment to a host process, and the RVC4 spends
+# everything on depth. Depth and rgb are identical under all four.
+#
+#   "left"  on-device NN on the IR-flood-lit mono camera -- works in a dark
+#           room. Keypoints are remapped into the CAM_A frame server-side, so
+#           consumers never learn which camera saw them.
+#   "rgb"   on-device NN on the colour camera (needs visible light).
+#   "host"  pose_server.py, started and stopped by this process.
+#   "none"  nobody here -- for running pose_server.py by hand, on another
+#           machine, or under a debugger.
 POSE_SOURCE = os.environ.get("NICE_STREAM_POSE_SOURCE", "left")
+POSE_SOURCES = ("left", "rgb", "host", "none")
+
+
+def device_pose() -> bool:
+    """True when the camera runs the pose NN itself.
+
+    'host' and 'none' both hand the pose segment to another process and
+    differ only in whether this one starts it, so every place that asks "is
+    the device doing pose?" has to ask it this way rather than testing
+    against "none".
+    """
+    return POSE_SOURCE in ("left", "rgb")
 
 # Stereo quality preset. On RVC4 only ACCURACY and DENSITY differ: every
 # other name (HIGH_DETAIL, FAST_ACCURACY, FACE, ROBOTICS) resolves to the
@@ -158,6 +184,11 @@ def main() -> None:
 
     if INTERACTIVE:
         configure_interactively()
+    if POSE_SOURCE not in POSE_SOURCES:
+        raise SystemExit(
+            f"NICE_STREAM_POSE_SOURCE must be one of {'/'.join(POSE_SOURCES)}, "
+            f"got {POSE_SOURCE!r}. Refusing to guess: every wrong value would "
+            f"otherwise read as 'no pose', which looks like a broken camera.")
     log.info("config: pose source=%s  model=%s  ir dot=%.2f flood=%.2f",
              POSE_SOURCE, POSE_MODEL, IR_DOT, IR_FLOOD)
 
@@ -166,8 +197,13 @@ def main() -> None:
     set_status(STATUS_STARTING)
     nsk.commit_frame(buf_depth, 0)
     nsk.commit_frame(buf_rgb, 0)
-    if POSE_SOURCE != "none":       # never stomp pose_server's commits
+    if device_pose():               # never stomp a host backend's commits
         nsk.commit_frame(buf_pose, 0)
+
+    # After the segments exist, so the child attaches on its first look
+    # instead of logging that it is waiting for us.
+    if POSE_SOURCE == "host":
+        start_host_pose()
 
     ids = {"depth": 0, "rgb": 0, "pose": 0}
     delay = RETRY_DELAY
@@ -246,7 +282,7 @@ def stream_once(ids: dict[str, int]) -> dict[str, int]:
 
         configure_depth_filters(stereo)
 
-        pose_enabled = POSE_SOURCE != "none"
+        pose_enabled = device_pose()
         pose_on_left = POSE_SOURCE == "left"
 
         nn: Any = None
@@ -279,7 +315,8 @@ def stream_once(ids: dict[str, int]) -> dict[str, int]:
             nn = pipeline.create(ParsingNeuralNetwork).build(pose_out, nn_archive)
         else:
             log.info("on-device pose disabled -- pose_server.py owns the "
-                     "pose segment")
+                     "pose segment (%s)", "started by us"
+                     if POSE_SOURCE == "host" else "start it yourself")
 
         # Small queues, non-blocking: we always want the newest frame, and a
         # stalled consumer must never apply back-pressure to the device.
@@ -672,7 +709,7 @@ def write_headers(fx: float = 0.0, fy: float = 0.0,
     # blank its intrinsics at startup (consumers divide by fx while
     # pose_server's committed frames are still readable). Real intrinsics
     # from a connected camera are still shared -- pose_server copies them.
-    if POSE_SOURCE != "none" or fx != 0.0:
+    if device_pose() or fx != 0.0:
         nsk.write_pose_header(buf_pose, intr)
 
 
@@ -692,7 +729,7 @@ def configure_interactively() -> None:
     print("\n=== nice-stream setup ===")
     print("  [1] non-IR camera (dev)      pose=rgb   dot=0    flood=0")
     print("  [2] IR camera (gallery)      pose=left  dot=0.8  flood=0.5")
-    print("  [3] host pose backend        pose=none  (run pose_server.py; IR from env)")
+    print("  [3] host pose backend        pose=host  (starts pose_server.py; IR from env)")
     print(f"  [4] env config               pose={POSE_SOURCE}  "
           f"dot={IR_DOT:g}  flood={IR_FLOOD:g}")
     print("  [5] custom")
@@ -703,17 +740,18 @@ def configure_interactively() -> None:
     elif choice == "2":
         POSE_SOURCE, IR_DOT, IR_FLOOD = "left", 0.8, 0.5
     elif choice == "3":
-        POSE_SOURCE = "none"
+        POSE_SOURCE = "host"
     elif choice == "5":
         while True:
-            POSE_SOURCE = _ask("pose source (left/rgb/none)", POSE_SOURCE)
-            if POSE_SOURCE in ("left", "rgb", "none"):
+            POSE_SOURCE = _ask("pose source (" + "/".join(POSE_SOURCES) + ")",
+                               POSE_SOURCE)
+            if POSE_SOURCE in POSE_SOURCES:
                 break
-            print("  ! must be 'left', 'rgb' or 'none'")
+            print("  ! must be one of " + ", ".join(POSE_SOURCES))
         IR_DOT   = _ask("IR dot intensity 0..1", IR_DOT, float)
         IR_FLOOD = _ask("IR flood intensity 0..1", IR_FLOOD, float)
 
-    if POSE_SOURCE != "none":                # model is moot without a device NN
+    if device_pose():                        # model is moot without a device NN
         _choose_model()
 
 
@@ -754,6 +792,82 @@ def _ask(label: str, current: Any, parse: type[Any] = str) -> Any:
         return current
 
 
+# ---------------------------------------------------------- host backend ----
+_pose_proc: subprocess.Popen[bytes] | None = None
+
+
+def start_host_pose() -> None:
+    """Runs pose_server.py as a child of this process.
+
+    The point is that choosing a pose backend is one decision in one place.
+    Started by hand it is three: demote the on-device NN, remember to launch
+    the second process, and remember to stop it again -- and getting the
+    first one wrong puts two writers on one segment.
+
+    The child's output is inherited rather than piped, so both logs land in
+    the same terminal in real time. When a skeleton is wrong, which side
+    dropped it is the first question, and interleaved logs answer it.
+    """
+    global _pose_proc
+    script = Path(__file__).with_name("pose_server.py")
+    if not script.exists():
+        log.error("POSE_SOURCE=host but %s is missing -- nothing will write "
+                  "the pose segment", script)
+        return
+
+    # Its own process group, so it can be asked to stop rather than killed:
+    # on Windows only a group member can be sent CTRL_BREAK, and the
+    # alternative -- TerminateProcess -- would skip its segment cleanup.
+    kwargs: dict[str, Any] = {"cwd": str(script.parent)}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    _pose_proc = subprocess.Popen([sys.executable, str(script)], **kwargs)
+    log.info("started host pose backend: %s (pid %d)", script.name, _pose_proc.pid)
+
+    # A missing onnxruntime or rtmlib kills it within a second. Catch that
+    # here: the alternative is a room full of people wondering why nobody
+    # has a skeleton, with the reason two screens up in a log nobody reads.
+    time.sleep(2.0)
+    code = _pose_proc.poll()
+    if code is not None:
+        log.error("host pose backend exited immediately (code %s) -- no pose. "
+                  "Install it into this venv: pip install "
+                  '"onnxruntime-gpu[cuda,cudnn]" && pip install --no-deps '
+                  "rtmlib tqdm", code)
+        _pose_proc = None
+
+
+def stop_host_pose() -> None:
+    """Asks the child to stop the way Ctrl-C would, so it unlinks its own
+    segment, and escalates only if it will not. Killing it is safe -- it
+    holds no camera -- but a clean exit leaves less for the next run to
+    clear up."""
+    global _pose_proc
+    proc, _pose_proc = _pose_proc, None
+    if proc is None or proc.poll() is not None:
+        return
+
+    log.info("stopping host pose backend (pid %d)", proc.pid)
+    try:
+        proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt"
+                         else signal.SIGINT)
+    except (OSError, ValueError) as exc:      # already gone, or no such group
+        log.warning("could not signal the pose backend: %s", exc)
+
+    try:
+        proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        log.warning("pose backend ignored the stop signal -- killing it")
+        proc.kill()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            log.error("pose backend (pid %d) will not die", proc.pid)
+
+
 # ------------------------------------------------------------- shutdown ----
 _running = True
 
@@ -766,12 +880,21 @@ def _stop(signum: int, _frame: FrameType | None) -> None:
 
 signal.signal(signal.SIGINT, _stop)
 signal.signal(signal.SIGTERM, _stop)
+# Ctrl-Break, and anything that stops this process the way this process
+# stops its own child. Without it SIGBREAK's default action kills us before
+# the finally block unlinks the segments.
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _stop)
 
 
 if __name__ == "__main__":
     try:
         main()
     finally:
+        # Before the segments go: the child is still reading them, and a
+        # reader faulting on an unmapped view is a worse last log line than
+        # a clean shutdown.
+        stop_host_pose()
         for seg in (shm_depth, shm_rgb, shm_pose):
             if seg is None:
                 continue

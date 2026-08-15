@@ -35,7 +35,25 @@ def test_profile_nonir_and_model_pick(monkeypatch):
 def test_profile_host_skips_model_menu(monkeypatch):
     feed(monkeypatch, "3")                     # host backend: no model prompt
     ss.configure_interactively()               # a second input() would raise
-    assert ss.POSE_SOURCE == "none"
+    assert ss.POSE_SOURCE == "host"
+    assert not ss.device_pose()
+
+
+def test_device_pose_only_for_on_device_sources():
+    """'host' and 'none' both mean the camera is not doing pose. Every gate
+    in the server keys off this rather than testing against "none", which is
+    what let 'host' be added without touching the pipeline."""
+    for source, expected in (("left", True), ("rgb", True),
+                             ("host", False), ("none", False)):
+        ss.POSE_SOURCE = source
+        assert ss.device_pose() is expected, source
+    assert set(ss.POSE_SOURCES) == {"left", "rgb", "host", "none"}
+
+
+def test_custom_profile_accepts_host(monkeypatch):
+    feed(monkeypatch, "5", "host", "0.1", "0.2")
+    ss.configure_interactively()               # no model prompt for a host run
+    assert ss.POSE_SOURCE == "host"
 
 
 def test_custom_profile_validates_source(monkeypatch):

@@ -9,10 +9,12 @@ publishes depth, RGB and pose frames into shared memory for the Unity side.
   memory. Run with `--interactive` (or `NICE_STREAM_INTERACTIVE=1` in the
   PyCharm run config) for a terminal profile/model picker on startup.
 - `pose_server.py` — optional host-side pose backend (RTMO on the GPU,
-  higher quality than the on-device YOLO). Run stream_server with
-  `NICE_STREAM_POSE_SOURCE=none` (interactive profile `[3]`), then this
-  alongside it. Writes the same pose segment; Unity can't tell the
-  difference. One-time install into the venv:
+  higher quality than the on-device YOLO). **You do not start this
+  yourself**: run stream_server with `NICE_STREAM_POSE_SOURCE=host`
+  (interactive profile `[3]`) and it starts and stops this for you, in the
+  same terminal. Writes the same pose segment; Unity can't tell the
+  difference. Use `=none` instead when you want to run it by hand, on
+  another machine, or under a debugger. One-time install into the venv:
 
       pip install "onnxruntime-gpu[cuda,cudnn]"
       pip install --no-deps rtmlib tqdm
@@ -33,6 +35,18 @@ publishes depth, RGB and pose frames into shared memory for the Unity side.
 - `calib_capture.py` — grabs rgb frames from the running stream into a zip
   that HubAI accepts as INT8 quantization-calibration data.
 
+**`stream_server.py` is the single entry point.** It owns the camera, and
+`NICE_STREAM_POSE_SOURCE` picks who produces the skeletons:
+
+| value | pose runs on | second process |
+| --- | --- | --- |
+| `left` (default) | the camera, IR mono — works in the dark | none |
+| `rgb` | the camera, colour — needs visible light | none |
+| `host` | your GPU, via RTMO | started for you |
+| `none` | nobody here | yours to start |
+
+Depth and rgb come out at full resolution under all four: the pose source
+decides who writes `nice_stream_pose`, never what the point cloud gets.
 Pose backends write the identical NSKP contract, so they are freely
 swappable per run; the on-device YOLO path stays the default. The wire
 layout lives in `nsk.py` (single source of truth, mirrored by the Unity

@@ -87,6 +87,7 @@ def main() -> None:
             time.sleep(0.003)
             continue
         last_fid, last_emit = fid, now
+        K = current_intrinsics(cast(nsk.Buf, shm.buf), K)
 
         detections: list[tuple[float, Vec3]] = []
         for conf, joints in persons:
@@ -179,11 +180,15 @@ def parse_args() -> argparse.Namespace:
 
 def attach_pose_segment(name: str) -> tuple[shared_memory.SharedMemory,
                                             int, int, int, nsk.Intrinsics]:
-    """Block until the pose segment exists and its header parses.
+    """Block until the pose segment exists, its header parses, and fx/fy land.
 
     A producer (pose_server in particular) may create the segment well
     before it writes the header -- an unparseable header means "not yet",
-    never "give up".
+    never "give up". Intrinsics are a second, later "not yet": stream_server
+    writes the header at startup with fx=fy=0 and only fills in the real
+    values once the camera connects, some 30 s later. Attaching inside that
+    window used to hand this bridge a zero fx that it kept forever, and
+    unprojecting the first person to walk in then divided by it.
     """
     while True:
         try:
@@ -200,6 +205,11 @@ def attach_pose_segment(name: str) -> tuple[shared_memory.SharedMemory,
             time.sleep(1.0)
             continue
         K = hdr["intrinsics"]
+        if not usable(K):
+            shm.close()
+            print(f"waiting for '{name}' intrinsics (camera connecting) ...")
+            time.sleep(1.0)
+            continue
         print(f"attached '{name}': {hdr['max_persons']} slots, "
               f"{hdr['num_kp']} kp, fx={K[0]:.1f}")
         return shm, hdr["max_persons"], hdr["num_kp"], hdr["stride"], K
@@ -223,6 +233,28 @@ def centroid_of(joints: list[nsk.Joint], K: nsk.Intrinsics) -> Vec3 | None:
     if sw == 0.0:
         return None
     return (sx / sw, sy / sw, sz / sw)
+
+
+def usable(K: nsk.Intrinsics) -> bool:
+    """Whether these intrinsics can unproject: a zero focal length cannot."""
+    return K[0] > 0.0 and K[1] > 0.0
+
+
+def current_intrinsics(buf: nsk.Buf, last: nsk.Intrinsics) -> nsk.Intrinsics:
+    """Re-read the header's intrinsics, holding the last usable pair.
+
+    Read every frame rather than cached at attach, because the producer can
+    be restarted under a running bridge: it blanks the header it shares and
+    leaves fx=fy=0 there for the ~30 s its camera needs to come up. Holding
+    the last usable pair keeps metres correct across that gap, while a
+    genuinely different camera's intrinsics are adopted as soon as they
+    land -- which caching at attach would silently miss.
+    """
+    hdr = nsk.parse_pose_header(buf)
+    if hdr is None:
+        return last
+    K = hdr["intrinsics"]
+    return K if usable(K) else last
 
 
 def address_filter(patterns: str | None) -> Callable[[str], bool]:
