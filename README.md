@@ -20,6 +20,10 @@ publishes depth, RGB and pose frames into shared memory for the Unity side.
   Model via `NICE_STREAM_RTMO_MODEL` = `s` | `m` (default) | `l` | a path
   or URL. Watch the startup log for `onnxruntime providers:` — if
   CUDAExecutionProvider is missing it fell back to CPU.
+  `NICE_STREAM_POSE_ROI="x,y,w,h"` (source pixels, empty = whole frame)
+  crops the frame before it reaches the network, so visitors arrive at more
+  pixels: `320,80,640,640` fills the 640x640 input from a 1280x800 frame
+  with no padding and no downscaling.
 - `osc_bridge.py` — pose segment -> OSC movement signals under `/nice/...`
   (Sonic Pi etc.; see `sonicpi_example.rb`).
 - `osc_monitor.py` — terminal OSC monitor; debugs the bridge without

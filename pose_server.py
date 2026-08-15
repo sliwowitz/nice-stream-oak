@@ -31,6 +31,14 @@ Env:
                            to leave GPU headroom for Unity/VR)
   NICE_STREAM_RTMO_SCORE   person score threshold     (default 0.45)
   NICE_STREAM_GPU_MEM_MB   ORT VRAM arena cap in MB   (default 0 = off)
+  NICE_STREAM_POSE_ROI     "x,y,w,h" source-pixel crop (default empty = the
+                           whole frame)
+
+The whole 1280x800 frame letterboxes into RTMO's 640x640 input at half
+scale with 240 rows of grey, so a visitor arrives at half the pixels the
+network could give them. NICE_STREAM_POSE_ROI crops to the part of the room
+visitors occupy first: "320,80,640,640" is square, so it pads nothing, and
+it is exactly 640x640, so it is not downscaled either.
 """
 
 import logging
@@ -49,7 +57,7 @@ import numpy as np
 import numpy.typing as npt
 
 import nsk
-from nsk import KP_CONF_MIN, MAX_PERSONS, NUM_KP
+from nsk import MAX_PERSONS, NUM_KP
 
 # ---------------------------------------------------------------- config ----
 SHM_DEPTH = os.environ.get("NICE_STREAM_SHM_DEPTH", "nice_stream_depth")
@@ -71,6 +79,13 @@ ORT_DEVICE = os.environ.get("NICE_STREAM_ORT_DEVICE", "cuda")
 POSE_FPS   = float(os.environ.get("NICE_STREAM_POSE_FPS", "30"))
 SCORE_THR  = float(os.environ.get("NICE_STREAM_RTMO_SCORE", "0.45"))
 GPU_MEM_MB = int(os.environ.get("NICE_STREAM_GPU_MEM_MB", "0"))
+
+# Crop fed to the network, in source pixels; resolved against the real frame
+# size once the rgb header appears (see resolve_pose_roi).
+POSE_ROI   = os.environ.get("NICE_STREAM_POSE_ROI", "")
+
+RTMO_INPUT = 640                    # square input of every body7 export
+PAD_GREY   = 114                    # rtmlib/YOLOX letterbox fill value
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +120,7 @@ def main() -> None:
              "created" if created else "attached to", SHM_POSE)
     last_rgb_id = 0
     pose_id = 0
+    letterbox: nsk.RoiLetterbox | None = None   # roi + fit into the model input
     interval = 1.0 / POSE_FPS if POSE_FPS > 0 else 0.0
     next_infer = 0.0
     next_writer_warn = 0.0
@@ -136,6 +152,8 @@ def main() -> None:
                 continue
             waiting_logged = False
             ensure_pose_header(pose_buf, rgb_hdr)
+            if letterbox is None:
+                letterbox = resolve_pose_roi(rgb_hdr["w"], rgb_hdr["h"])
             now = time.time()
 
             # Dual-writer watchdog: every id in this segment should be one
@@ -169,9 +187,7 @@ def main() -> None:
             last_rgb_id = fid
             next_infer = max(next_infer + interval, now)
 
-            # Segment holds RGB888; rtmlib/RTMO expects BGR (cv2 convention).
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            kpts, scores = model(bgr)
+            kpts, scores = model(to_model_input(frame, letterbox))
 
             # rtmlib returns one all-zero person when nothing was found.
             persons = [(k, s) for k, s in zip(kpts, scores, strict=True)
@@ -185,8 +201,8 @@ def main() -> None:
                 continue                     # no depth yet: hold last pose
 
             pose_id += 1
-            nsk.write_pose_slots(pose_buf,
-                                 build_persons(persons, depth_frame), pose_id)
+            nsk.write_pose_slots(
+                pose_buf, build_persons(persons, depth_frame, letterbox), pose_id)
 
             fps_n += 1
             if fps_n >= 60:
@@ -270,23 +286,65 @@ def ensure_pose_header(pose_buf: nsk.Buf, rgb_hdr: nsk.FrameHeader) -> None:
     log.info("wrote pose header (intrinsics from rgb segment)")
 
 
+# ------------------------------------------------------------- pose input ---
+def resolve_pose_roi(frame_w: int, frame_h: int) -> nsk.RoiLetterbox:
+    """Resolve NICE_STREAM_POSE_ROI against the frame and log what it became.
+
+    Runs once, when the rgb header first appears -- until then the frame
+    size a crop has to fit inside is unknown.
+    """
+    roi, complaint = nsk.resolve_roi(POSE_ROI, frame_w, frame_h)
+    if complaint is not None:
+        log.warning("%s", complaint)
+    letterbox = nsk.roi_letterbox(roi, RTMO_INPUT, RTMO_INPUT)
+    content_w, content_h = letterbox.content_size()
+    log.info("pose input: roi %d,%d %dx%d of %dx%d -> %dx%d picture in "
+             "%dx%d (scale %.3f, pad %.0f/%.0f)",
+             roi.x, roi.y, roi.w, roi.h, frame_w, frame_h,
+             content_w, content_h, RTMO_INPUT, RTMO_INPUT,
+             letterbox.scale, letterbox.pad_x, letterbox.pad_y)
+    return letterbox
+
+
+def to_model_input(frame: npt.NDArray[np.uint8],
+                   letterbox: nsk.RoiLetterbox) -> npt.NDArray[np.uint8]:
+    """Crop the roi out of an rgb frame and letterbox it into RTMO's input.
+
+    RTMO letterboxes whatever it is handed, so cropping alone would only be
+    undone by its own resize; building the model input here is what lets the
+    roi reach the network. rtmlib passes an image that already matches the
+    model input size straight through, so this stays the only resize.
+    """
+    roi = letterbox.roi
+    crop = frame[roi.y:roi.y + roi.h, roi.x:roi.x + roi.w]
+    # Segment holds RGB888; rtmlib/RTMO expects BGR (cv2 convention).
+    bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+    content_w, content_h = letterbox.content_size()
+    if (content_w, content_h) != (roi.w, roi.h):
+        bgr = cv2.resize(bgr, (content_w, content_h),
+                         interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((RTMO_INPUT, RTMO_INPUT, 3), PAD_GREY, np.uint8)
+    x0, y0 = int(letterbox.pad_x), int(letterbox.pad_y)
+    canvas[y0:y0 + content_h, x0:x0 + content_w] = bgr
+    return canvas
+
+
 # ------------------------------------------------------------- pose write ---
 def build_persons(rtmo_persons: Sequence[tuple[npt.NDArray[Any], npt.NDArray[Any]]],
-                  depth: npt.NDArray[np.uint16]) -> list[nsk.Person]:
+                  depth: npt.NDArray[np.uint16],
+                  letterbox: nsk.RoiLetterbox) -> list[nsk.Person]:
     """Turn RTMO output into nsk person tuples, depth-lifting each keypoint.
 
-    rtmo_persons: list of (kpts (17, 2) full-frame px, scores (17,)).
-    The edge gate and serialization live in nsk.write_pose_slots.
+    rtmo_persons: list of (kpts (17, 2) model-input px, scores (17,)).
+    `letterbox` carries those pixels back to the source frame, which is the
+    grid the depth map and the wire contract both use. The inboard sampling,
+    the edge gate and serialization live in nsk.
     """
     persons = []
     for kpts, scores in rtmo_persons:
-        joints = []
-        for i in range(NUM_KP):
-            px, py = float(kpts[i, 0]), float(kpts[i, 1])
-            conf = float(scores[i])
-            z = nsk.depth_at(depth, px, py) if conf > KP_CONF_MIN else 0.0
-            joints.append((px, py, z, conf))
-        persons.append((float(np.mean(scores)), joints))
+        points = [(*letterbox.to_source(float(kpts[i, 0]), float(kpts[i, 1])),
+                   float(scores[i])) for i in range(NUM_KP)]
+        persons.append((float(np.mean(scores)), nsk.lift_joints(depth, points)))
     return persons
 
 

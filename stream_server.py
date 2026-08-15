@@ -45,7 +45,6 @@ from depthai_nodes.node import ParsingNeuralNetwork
 import nsk
 from nsk import (
     HEADER_SIZE,
-    KP_CONF_MIN,
     LINK_ETHERNET,
     LINK_NAMES,
     LINK_UNKNOWN,
@@ -88,9 +87,12 @@ IR_FLOOD = float(os.environ.get("NICE_STREAM_IR_FLOOD", "0.5"))
 # pose segment instead, and the RVC4 spends everything on depth.
 POSE_SOURCE = os.environ.get("NICE_STREAM_POSE_SOURCE", "left")
 
-# Stereo quality preset. HIGH_DETAIL maximizes point-cloud quality (subpixel,
-# heavy post-processing) at some fps cost; DEFAULT is the faster fallback.
-STEREO_PRESET = os.environ.get("NICE_STREAM_STEREO_PRESET", "HIGH_DETAIL")
+# Stereo quality preset. On RVC4 only ACCURACY and DENSITY differ: every
+# other name (HIGH_DETAIL, FAST_ACCURACY, FACE, ROBOTICS) resolves to the
+# same ACCURACY branch inside depthai, so asking for HIGH_DETAIL here is
+# ACCURACY with extra steps. DENSITY fills more of the frame and trusts
+# weaker matches -- more points, more wobble.
+STEREO_PRESET = os.environ.get("NICE_STREAM_STEREO_PRESET", "ACCURACY")
 
 # Any HubAI slug depthai-nodes can parse (the YOLO-pose family is the safe
 # bet), OR a path to a local NNArchive (.tar.xz) -- e.g. a YOLO11-pose
@@ -231,7 +233,7 @@ def stream_once(ids: dict[str, int]) -> dict[str, int]:
             left=left.requestOutput((W, H), fps=FPS),
             right=right.requestOutput((W, H), fps=FPS))
         preset = getattr(dai.node.StereoDepth.PresetMode, STEREO_PRESET,
-                         dai.node.StereoDepth.PresetMode.HIGH_DETAIL)
+                         dai.node.StereoDepth.PresetMode.ACCURACY)
         stereo.setDefaultProfilePreset(preset)
         log.info("stereo preset: %s", preset.name)
 
@@ -441,22 +443,47 @@ def link_suffix() -> str:
 def configure_depth_filters(stereo: dai.node.StereoDepth) -> None:
     """Enables on-device depth post-processing. Temporal is the flicker
     killer: static scenes stop shimmering. Runs on the RVC4, costs the
-    host nothing."""
+    host nothing.
+
+    The RVC4 presets ship every filter disabled, so this function is what
+    turns them on at all.
+
+    Wobble -- points oscillating in depth on a scene that is not moving --
+    is what these settings fight, and the two ways to fight it are not
+    equal. Averaging over time (alpha) steadies a static scene and smears a
+    moving person by exactly the same factor. Rejecting untrustworthy
+    pixels (delta, confidence) costs fill rate instead of lag. Prefer the
+    second: a person walking through the room must not smear.
+    """
     pp = stereo.initialConfig.postProcessing
     pp.temporalFilter.enable = True
     pp.temporalFilter.alpha = 0.35          # lower = smoother, more lag
-    pp.temporalFilter.delta = 30            # mm; jumps larger than this pass through
+    # DISPARITY units, not millimetres. The device's own "auto" is three
+    # integer disparity levels, which at RVC4's fixed 4 subpixel bits is
+    # 3 * 16 = 48. Below that the filter disengages more eagerly than the
+    # default and does LESS than leaving it alone; above it, more pixels
+    # keep averaging and moving edges start to smear.
+    pp.temporalFilter.delta = 48
     pp.temporalFilter.persistencyMode = \
         dai.StereoDepthConfig.PostProcessing.TemporalFilter.PersistencyMode.VALID_2_IN_LAST_4
     pp.speckleFilter.enable = True          # kills lone flying pixels
     pp.speckleFilter.speckleRange = 50
     pp.thresholdFilter.minRange = 300       # mm, matches ValidRange in Unity
     pp.thresholdFilter.maxRange = 12000
-    # Edge-preserving smoothing + small hole filling: visibly calmer
-    # point-cloud surfaces; costs device compute we now have to spare.
-    pp.spatialFilter.enable = True
-    pp.spatialFilter.holeFillingRadius = 2
-    pp.spatialFilter.numIterations = 1
+
+    # Spatial filtering is intra-frame: it cannot lower frame-to-frame
+    # variance, so it buys no stability at all -- it only softens the
+    # surfaces we want crisp. Left off deliberately.
+    pp.spatialFilter.enable = False
+
+    # Scores a pixel down when its neighbourhood moves about between frames,
+    # and INVALIDATES rather than smooths: stability with no lag, paid for in
+    # fill rate. The one anti-wobble knob free of smear, so reach for it
+    # first when the cloud shimmers. Weight is 4 out of 32 by default;
+    # raising it makes temporal instability count for more against a pixel.
+    # motionVectorConfidenceThreshold (0..3, default 1) is the second lever:
+    # higher rejects more variance and costs more fill.
+    stereo.initialConfig.confidenceMetrics.motionVectorConfidenceWeight = 16
 
 
 def resolve_pose_archive(pipeline: dai.Pipeline) -> dai.NNArchive:
@@ -577,25 +604,27 @@ def write_pose(detections: Any, depth_frame: DepthMap, frame_id: int,
     `to_frame` maps a parser keypoint to full-frame pixels (letterbox undo);
     depth_frame must be in that same frame. When the NN runs on the left mono
     camera, `remap` converts (px, py, z) from the left frame into CAM_A
-    pixels + metres so the stream contract never changes. Depth-edge gating
-    and serialization live in nsk.write_pose_slots.
+    pixels + metres so the stream contract never changes. The depth lift
+    (nsk.lift_joints) samples inboard along each bone; the edge gate and
+    serialization live in nsk.write_pose_slots.
     """
     dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
 
     persons: list[nsk.Person] = []
     for det in dets[:MAX_PERSONS]:
         kps = det.getKeypoints()
-        joints: list[nsk.Joint] = []         # (px, py, z, conf) per keypoint
+        points: list[tuple[float, float, float]] = []    # px, py, conf
         for i in range(NUM_KP):
             if i < len(kps):
                 px, py = to_frame(kps[i])
-                z = nsk.depth_at(depth_frame, px, py) \
-                    if kps[i].confidence > KP_CONF_MIN else 0.0
-                if remap is not None and z > 0.0:
-                    px, py, z = remap(px, py, z)
-                joints.append((px, py, z, kps[i].confidence))
+                points.append((px, py, float(kps[i].confidence)))
             else:
-                joints.append((0.0, 0.0, 0.0, 0.0))
+                points.append((0.0, 0.0, 0.0))
+
+        joints = nsk.lift_joints(depth_frame, points)
+        if remap is not None:
+            joints = [(*remap(px, py, z), conf) if z > 0.0 else (px, py, z, conf)
+                      for px, py, z, conf in joints]
         persons.append((det.confidence, joints))
 
     nsk.write_pose_slots(buf_pose, persons, frame_id)

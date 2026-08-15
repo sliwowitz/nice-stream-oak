@@ -55,7 +55,7 @@ import struct
 import time
 from collections.abc import Sequence
 from multiprocessing import shared_memory
-from typing import TypedDict
+from typing import NamedTuple, TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -100,11 +100,47 @@ LINK_NAMES = {
 }
 
 # Depth-lift rules shared by every pose producer.
-DEPTH_PATCH   = 2                   # median over (2k+1)^2 px per keypoint
-JOINT_DEV_MAX = 1.5                 # m; a joint further than this from the
+DEPTH_PATCH       = 2               # median over (2k+1)^2 px per keypoint
+DEPTH_SPLIT_GAP   = 0.25            # m; an empty depth band this wide inside
+                                    # one patch means two surfaces, not one
+DEPTH_SPLIT_SHARE = 0.2             # fraction of the patch the far surface
+                                    # must cover to count as a surface: one
+                                    # full column of the 5x5, the narrowest
+                                    # a silhouette edge can slice off
+INBOARD_STEP      = 0.2             # fraction of the bone walked from a
+                                    # keypoint towards its parent before
+                                    # depth is sampled
+JOINT_DEV_MAX     = 0.8             # m; a joint further than this from the
                                     # person's median depth sampled the
-                                    # background -- its z is dropped
-KP_CONF_MIN   = 0.3                 # keypoints below this get no depth lift
+                                    # background -- its z is dropped. One
+                                    # body spans about this much front to
+                                    # back: ~0.3 m of torso plus an arm
+                                    # reached towards the camera.
+KP_CONF_MIN       = 0.3             # keypoints below this get no depth lift
+
+# COCO skeleton: the joint to step towards when sampling depth inboard from
+# each keypoint (-1 = nothing to step towards). Limb ends point up the limb,
+# trunk joints across the trunk, so every step leads away from the
+# silhouette and into the body.
+KP_PARENT = (
+    -1,     # nose
+     0,     # l_eye      -> nose
+     0,     # r_eye      -> nose
+     1,     # l_ear      -> l_eye
+     2,     # r_ear      -> r_eye
+    11,     # l_shoulder -> l_hip
+    12,     # r_shoulder -> r_hip
+     5,     # l_elbow    -> l_shoulder
+     6,     # r_elbow    -> r_shoulder
+     7,     # l_wrist    -> l_elbow
+     8,     # r_wrist    -> r_elbow
+     5,     # l_hip      -> l_shoulder
+     6,     # r_hip      -> r_shoulder
+    11,     # l_knee     -> l_hip
+    12,     # r_knee     -> r_hip
+    13,     # l_ankle    -> l_knee
+    14,     # r_ankle    -> r_knee
+)
 
 # A writable view of a shared-memory segment (or a bytearray in tests).
 Buf = bytearray | memoryview
@@ -281,10 +317,50 @@ def read_pose_frame(buf: Buf, max_p: int, n_kp: int,
 
 
 # ------------------------------------------------------------ depth lift ----
+def lift_joints(depth: npt.NDArray[np.uint16],
+                points: Sequence[tuple[float, float, float]]) -> list[Joint]:
+    """Give every keypoint a z in metres, sampled inboard along its bone.
+
+    points: (px, py, confidence) per COCO keypoint, on the depth map's pixel
+    grid. A keypoint at or below KP_CONF_MIN keeps z = 0 -- consumers read
+    that as "no depth here". Depth comes from a point stepped towards the
+    keypoint's parent (KP_PARENT), which keeps wrists and ankles off the
+    silhouette; the keypoint itself is the fallback.
+    """
+    joints: list[Joint] = []
+    for i, (px, py, conf) in enumerate(points):
+        if conf <= KP_CONF_MIN:
+            joints.append((px, py, 0.0, conf))
+            continue
+        parent = KP_PARENT[i] if i < len(KP_PARENT) else -1
+        if 0 <= parent < len(points) and points[parent][2] > KP_CONF_MIN:
+            toward_x, toward_y, _ = points[parent]
+            z = depth_inboard(depth, px, py, toward_x, toward_y)
+        else:
+            z = depth_at(depth, px, py)
+        joints.append((px, py, z, conf))
+    return joints
+
+
+def depth_inboard(depth: npt.NDArray[np.uint16], px: float, py: float,
+                  toward_x: float, toward_y: float) -> float:
+    """Sample depth INBOARD_STEP of the way from (px, py) towards a joint.
+
+    A limb end sits on the silhouette: half of a wrist's patch is forearm,
+    half is the room behind it. One step along the bone puts the patch in
+    the middle of the limb, where the depth map is dense and unambiguous.
+    Falls back to the keypoint when the inboard sample finds nothing, so a
+    foreshortened or occluded limb is no worse off than before.
+    """
+    z = depth_at(depth, px + (toward_x - px) * INBOARD_STEP,
+                 py + (toward_y - py) * INBOARD_STEP)
+    return z if z > 0.0 else depth_at(depth, px, py)
+
+
 def depth_at(depth: npt.NDArray[np.uint16], px: float, py: float) -> float:
     """Sample the median depth (metres) in a small patch of a u16-mm map;
-    0.0 when nothing valid (out of bounds, NaN coordinates, or an empty
-    patch)."""
+    0.0 when nothing valid (out of bounds, NaN coordinates, an empty patch,
+    or a patch split across a silhouette)."""
     if not (np.isfinite(px) and np.isfinite(py)):
         return 0.0          # a NaN keypoint must not kill the producer
     h, w = depth.shape
@@ -295,9 +371,37 @@ def depth_at(depth: npt.NDArray[np.uint16], px: float, py: float) -> float:
     y0, y1 = max(0, y - DEPTH_PATCH), min(h, y + DEPTH_PATCH + 1)
     patch = depth[y0:y1, x0:x1]
     valid = patch[patch > 0]
-    if valid.size == 0:
+    if valid.size == 0 or patch_is_split(valid):
         return 0.0
     return float(np.median(valid)) * 0.001
+
+
+def patch_is_split(valid: npt.NDArray[np.uint16]) -> bool:
+    """True when the patch's valid pixels sit on two surfaces, not one.
+
+    A patch on a silhouette boundary holds the person and whatever stands
+    behind them. Its median belongs to whichever of the two owns more
+    pixels, so a wrist a few pixels from the edge can report the far wall
+    with the same confidence as the arm -- exactly the lie the caller must
+    not receive.
+
+    The test: split the valid pixels at the midpoint between nearest and
+    farthest, then ask whether the two sides are really two surfaces. They
+    are when no pixel lies within DEPTH_SPLIT_GAP of the divide (a surface
+    is continuous, however slanted; a boundary is a jump) and the smaller
+    side still covers DEPTH_SPLIT_SHARE of the patch (a surface has area, a
+    flying pixel does not -- and the median already absorbs those).
+    """
+    near_mm, far_mm = int(valid.min()), int(valid.max())
+    if (far_mm - near_mm) * 0.001 <= DEPTH_SPLIT_GAP:
+        return False
+    mid_mm = (near_mm + far_mm) // 2
+    near_side, far_side = valid[valid <= mid_mm], valid[valid > mid_mm]
+    if far_side.size == 0:
+        return False
+    gap = (int(far_side.min()) - int(near_side.max())) * 0.001
+    minority = min(near_side.size, far_side.size) / valid.size
+    return gap > DEPTH_SPLIT_GAP and minority >= DEPTH_SPLIT_SHARE
 
 
 def gate_depth_edges(joints: Sequence[Joint]) -> list[Joint]:
@@ -346,3 +450,85 @@ def letterbox_transform(src_w: float, src_h: float, dst_w: float,
     dst = src * scale + pad. Invert to map detections back to src pixels."""
     scale = min(dst_w / src_w, dst_h / src_h)
     return scale, (dst_w - src_w * scale) * 0.5, (dst_h - src_h * scale) * 0.5
+
+
+# ------------------------------------------------------ region of interest --
+ROI_MIN_SIDE = 16                   # px; a smaller crop cannot hold a person
+
+
+class Roi(NamedTuple):
+    """Crop rectangle in source pixels, taken before the letterbox."""
+
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+class RoiLetterbox(NamedTuple):
+    """Crop-then-letterbox placement of a source frame into a model input.
+
+    A keypoint travels source -> crop -> scale -> pad on the way into the
+    network, so the way home undoes all three. to_model and to_source are
+    inverses; both speak pixels.
+    """
+
+    roi: Roi
+    scale: float
+    pad_x: float
+    pad_y: float
+
+    def to_model(self, x: float, y: float) -> tuple[float, float]:
+        """Map a source pixel into model-input pixels."""
+        return ((x - self.roi.x) * self.scale + self.pad_x,
+                (y - self.roi.y) * self.scale + self.pad_y)
+
+    def to_source(self, x: float, y: float) -> tuple[float, float]:
+        """Map a model-input pixel back to source pixels."""
+        return ((x - self.pad_x) / self.scale + self.roi.x,
+                (y - self.pad_y) / self.scale + self.roi.y)
+
+    def content_size(self) -> tuple[int, int]:
+        """Size in whole pixels of the scaled crop inside the model input."""
+        return int(self.roi.w * self.scale), int(self.roi.h * self.scale)
+
+
+def resolve_roi(spec: str, frame_w: int, frame_h: int) -> tuple[Roi, str | None]:
+    """Read an "x,y,w,h" crop spec in source pixels against a frame.
+
+    An empty spec means the whole frame. The rectangle is clamped into the
+    frame. A spec that will not parse, or that clamps down to less than
+    ROI_MIN_SIDE on either side, falls back to the whole frame and returns
+    the reason as a message for the caller to log.
+    """
+    whole = Roi(0, 0, frame_w, frame_h)
+    if not spec.strip():
+        return whole, None
+    try:
+        numbers = [int(part) for part in spec.replace(" ", "").split(",")]
+    except ValueError:
+        numbers = []
+    if len(numbers) != 4:
+        return whole, f"pose roi '{spec}' is not 'x,y,w,h' -- using full frame"
+
+    x, y, w, h = numbers
+    x = min(max(x, 0), frame_w - 1)
+    y = min(max(y, 0), frame_h - 1)
+    w, h = min(w, frame_w - x), min(h, frame_h - y)
+    if w < ROI_MIN_SIDE or h < ROI_MIN_SIDE:
+        return whole, (f"pose roi '{spec}' clamps to {w}x{h} px inside "
+                       f"{frame_w}x{frame_h} -- using full frame")
+    return Roi(x, y, w, h), None
+
+
+def roi_letterbox(roi: Roi, dst_w: float, dst_h: float) -> RoiLetterbox:
+    """Place a crop centred into a dst_w x dst_h model input.
+
+    Pick the rectangle for the part of the room visitors occupy, and pick it
+    to fit the network: a roi with the model's aspect ratio pads nothing, so
+    the whole tensor carries picture instead of grey. A roi no larger than
+    the model input is not downscaled either -- against a 1280x800 frame and
+    a 640x640 model, Roi(320, 80, 640, 640) is both.
+    """
+    scale, pad_x, pad_y = letterbox_transform(roi.w, roi.h, dst_w, dst_h)
+    return RoiLetterbox(roi, scale, pad_x, pad_y)
